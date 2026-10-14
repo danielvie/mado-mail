@@ -44,6 +44,12 @@ actions!(
 
 const DIVIDER: f32 = 6.;
 const SCROLLBAR_WIDTH: f32 = 12.;
+fn row_background(row: &Row, hovered: Option<&str>, active: bool, p: Palette) -> gpui::Hsla {
+    let bg = if active { p.panel2.blend(p.accent.opacity(0.12)) } else if row.child { p.panel2 } else { p.canvas };
+    let highlighted = hovered.is_some_and(|key| key == row.key
+        || (row.child && key.strip_prefix("b:").is_some_and(|sender| sender == sender_address(&row.sender))));
+    if highlighted { bg.blend(gpui::black().opacity(0.04)) } else { bg }
+}
 fn scrollbar_thumb(viewport: f32, content: f32, offset: f32) -> Option<(f32, f32)> {
     if viewport <= 0. || content <= viewport { return None; }
     let height = (viewport * viewport / content).max(24.).min(viewport);
@@ -142,6 +148,7 @@ enum Command {
     Rules,
     Stage(Vec<String>, Action),
     SetRead(Vec<String>, bool),
+    MarkReadArchive(Vec<String>),
     Expand(String),
     Open(String),
     RowMenu(String),
@@ -222,6 +229,7 @@ struct MailApp {
     label_focus: BTreeMap<String, FocusHandle>,
     row_bounds: BTreeMap<String, Bounds<Pixels>>,
     hovered_row: Option<String>,
+    hovered_read_archive: Option<String>,
     mail_drag: Option<MailDrag>,
     drop_target: Option<Action>,
     suppress_row_click: bool,
@@ -393,6 +401,7 @@ impl MailApp {
             label_focus: BTreeMap::new(),
             row_bounds: BTreeMap::new(),
             hovered_row: None,
+            hovered_read_archive: None,
             mail_drag: None,
             drop_target: None,
             suppress_row_click: false,
@@ -631,18 +640,24 @@ impl MailApp {
         });
         cx.notify();
     }
-    fn set_read(&mut self, ids: Vec<String>, read: bool, cx: &mut Context<Self>) {
+    fn set_read(&mut self, ids: Vec<String>, read: bool, archive: bool, cx: &mut Context<Self>) {
         if !self.can_stage() { return; }
-        let ids: Vec<_> = self.triage.undecided_ids(&ids).into_iter().filter(|id| {
+        let targets = self.triage.undecided_ids(&ids);
+        let archive_ids = if archive { targets.clone() } else { Vec::new() };
+        let ids: Vec<_> = targets.into_iter().filter(|id| {
             self.triage.emails.iter().any(|e| &e.id == id && e.label_ids.iter().any(|label| label == "UNREAD") == read)
         }).collect();
-        if ids.is_empty() { return; }
+        if ids.is_empty() {
+            if archive { self.stage(archive_ids, Action::Archive, cx); }
+            return;
+        }
         self.row_menu = None;
         let state = if read { "read" } else { "unread" };
         if self.demo {
             self.triage.set_read(&ids, read);
             self.failed = false;
             self.status = format!("Marked {state} locally. Gmail was not contacted.");
+            if archive { self.stage(archive_ids, Action::Archive, cx); }
             cx.notify();
             return;
         }
@@ -663,27 +678,34 @@ impl MailApp {
         });
         cx.spawn(async move |this, cx| {
             let results = job.await;
-            let _ = this.update(cx, |this, cx| {
-                this.busy = false;
-                let mut confirmed = Vec::new();
-                let mut failed = 0;
-                let mut unknown = 0;
-                for (id, result) in results {
-                    match result {
-                        Ok(Some(Outcome::Confirmed)) => confirmed.push(id),
-                        Ok(Some(Outcome::Unknown(_))) => unknown += 1,
-                        _ => failed += 1,
-                    }
-                }
-                this.triage.set_read(&confirmed, read);
-                this.failed = failed > 0 || unknown > 0;
-                this.status = format!("{} marked {state} / {failed} failed / {unknown} unknown. {}", confirmed.len(),
-                    if unknown > 0 { "Refresh to check Gmail read status before retrying." }
-                    else if failed > 0 { "Unconfirmed messages were left unchanged. Check Gmail connection and retry." }
-                    else { "Messages remain in the Inbox." });
-                cx.notify();
-            });
+            let _ = this.update(cx, |this, cx| this.finish_read(results, read, archive_ids, cx));
         }).detach();
+    }
+    fn finish_read(&mut self, results: Vec<(String, Result<Option<Outcome>>)>, read: bool, archive_ids: Vec<String>, cx: &mut Context<Self>) {
+        self.busy = false;
+        let mut confirmed = Vec::new();
+        let mut failed = 0;
+        let mut unknown = 0;
+        for (id, result) in results {
+            match result {
+                Ok(Some(Outcome::Confirmed)) => confirmed.push(id),
+                Ok(Some(Outcome::Unknown(_))) => unknown += 1,
+                _ => failed += 1,
+            }
+        }
+        self.triage.set_read(&confirmed, read);
+        self.failed = failed > 0 || unknown > 0;
+        let state = if read { "read" } else { "unread" };
+        self.status = format!("{} marked {state} / {failed} failed / {unknown} unknown. {}", confirmed.len(),
+            if unknown > 0 { "Refresh to check Gmail read status before retrying." }
+            else if failed > 0 { "Unconfirmed messages were left unchanged. Check Gmail connection and retry." }
+            else { "Messages remain in the Inbox." });
+        if !archive_ids.is_empty() {
+            // Keep the batch in the Inbox until every read change is confirmed.
+            if self.failed { self.status.push_str(" Nothing archived."); }
+            else { self.stage(archive_ids, Action::Archive, cx); }
+        }
+        cx.notify();
     }
     fn submit(&mut self, recheck: bool, only: Option<Vec<String>>, cx: &mut Context<Self>) {
         if self.busy
@@ -978,7 +1000,8 @@ impl MailApp {
                 self.filter.update(cx, |i, cx| i.set("", cx));
             }
             Command::Stage(ids, action) => self.stage(ids, action, cx),
-            Command::SetRead(ids, read) => self.set_read(ids, read, cx),
+            Command::SetRead(ids, read) => self.set_read(ids, read, false, cx),
+            Command::MarkReadArchive(ids) => self.set_read(ids, true, true, cx),
             Command::Expand(sender) => {
                 let key = sender_address(&sender);
                 if !self.triage.expanded.remove(&key) {
@@ -1158,6 +1181,7 @@ impl MailApp {
                     Command::SaveRule | Command::CancelEdit | Command::EditAction(_)
                 ));
         let primary = matches!(command, Command::Apply | Command::SaveRule | Command::SaveSpace);
+        let row_action = label.is_empty() && matches!(command, Command::SetRead(..) | Command::Stage(_, Action::Archive));
         let destructive = matches!(
             command,
             Command::Stage(_, Action::Trash)
@@ -1196,8 +1220,14 @@ impl MailApp {
             .when(primary, |d| d.bg(p.accent).text_color(p.on_accent))
             .when(destructive, |d| d.text_color(p.danger))
             .cursor_pointer()
-            .focus(|s| s.border_color(p.accent))
-            .hover(|s| s.border_color(p.accent))
+            .focus(|s| {
+                let s = s.border_color(p.accent);
+                if row_action { s.bg(p.accent.opacity(0.14)) } else { s }
+            })
+            .hover(|s| {
+                let s = s.border_color(p.accent);
+                if row_action { s.bg(p.accent.opacity(0.14)) } else { s }
+            })
             .when(!enabled, |s| s.opacity(0.4))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -1253,7 +1283,9 @@ impl MailApp {
             || self.row_menu.as_ref().is_some_and(|m| m.row.key == row.key)
             || self.label_row_targets.as_ref().is_some_and(|(key, _)| key == &row.key);
         let can_stage = self.can_stage();
-        let bg = if active { p.panel2.blend(p.accent.opacity(0.12)) } else if row.child { p.panel2 } else { p.canvas };
+        let combined_hover = self.hovered_read_archive.as_ref() == Some(&row.key);
+        let combined_hover_key = row.key.clone();
+        let bg = row_background(&row, self.hovered_row.as_deref(), active, p);
         let badges = self.row_labels(&row);
         let budget = ((width - 90.) * 0.4).clamp(34., 220.);
         let subject_line = div().flex_1().min_w_0().w_full().flex().items_center().gap_2()
@@ -1270,6 +1302,7 @@ impl MailApp {
         let action_ids = self.triage.action_ids(&row);
         let action_scope = if selected { format!("{} selected messages", action_ids.len()) } else { format!("{} messages in this row", action_ids.len()) };
         let read_hint = format!("Mark {action_scope} as {}", if unread { "read" } else { "unread" });
+        let read_archive_hint = format!("Mark {action_scope} as read, then {} after confirmation", if self.settings.auto_apply { "archive now" } else { "stage Archive" });
         let archive_hint = format!("Archive {action_scope}");
         let trash_hint = format!("Trash {action_scope}");
         let label_hint = format!("Add label to {action_scope}");
@@ -1279,7 +1312,7 @@ impl MailApp {
         let drag_view = cx.weak_entity();
         let content = div().id(SharedString::from(format!("content-{}", row.key))).flex_1().min_w_0().flex().flex_col().gap_2()
             .child(div().w(px((width - 90.).max(0.))).min_w_0().flex_shrink_0().flex().items_center().gap_2()
-                .when(show_actions, |d| d.pr(px(196.)))
+                .when(show_actions, |d| d.pr(px(224.)))
                 .child(div().id(SharedString::from(format!("unread-{}", row.key))).size(px(6.)).flex_shrink_0().rounded_full()
                     .when(unread, |d| d.bg(p.accent).tooltip(move |_, cx| cx.new(|_| Hint(unread_hint)).into())))
                 .child(div().flex_1().min_w_0().truncate()
@@ -1314,7 +1347,10 @@ impl MailApp {
             }, |_, _, _, _| {}).absolute().inset_0())
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 if *hovered { this.hovered_row = Some(hover_key.clone()); }
-                else if this.hovered_row.as_ref() == Some(&hover_key) { this.hovered_row = None; }
+                else if this.hovered_row.as_ref() == Some(&hover_key) {
+                    this.hovered_row = None;
+                    this.hovered_read_archive = None;
+                }
                 cx.notify();
             }))
             .capture_any_mouse_down(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -1356,16 +1392,29 @@ impl MailApp {
                     .child(self.label_trigger_anchor(LabelMode::Assign, Some(row.key.clone()), cx))
                     .tooltip(move |_, cx| cx.new(|_| LabelHint(label_hint.clone())).into())
                     .child(icons::icon("icons/label.svg", p.ink_dim)))
-                .child(self.button(format!("read-{}", row.key), "", Command::SetRead(action_ids.clone(), unread), can_stage && (self.demo || self.session.is_some()), cx)
-                    .bg(p.panel2.opacity(0.35))
-                    .p_0().size(px(28.)).flex().items_center().justify_center()
-                    .tooltip(move |_, cx| cx.new(|_| LabelHint(read_hint.clone())).into())
-                    .child(icons::icon(if unread { "icons/mark-read.svg" } else { "icons/mark-unread.svg" }, p.ink_dim)))
-                .child(self.button(format!("archive-{}", row.key), "", Command::Stage(action_ids.clone(), Action::Archive), can_stage, cx)
-                    .bg(p.panel2.opacity(0.35))
-                    .p_0().size(px(28.)).flex().items_center().justify_center()
-                    .tooltip(move |_, cx| cx.new(|_| LabelHint(archive_hint.clone())).into())
-                    .child(icons::icon("icons/archive.svg", p.ink_dim)))
+                .child(div().h(px(28.)).flex().items_center().rounded_sm().overflow_hidden()
+                    .border_1().border_color(if combined_hover { p.accent } else { p.line })
+                    .bg(if combined_hover { p.accent.opacity(0.14) } else { p.panel2.opacity(0.35) })
+                    .child(self.button(format!("read-{}", row.key), "", Command::SetRead(action_ids.clone(), unread), can_stage && (self.demo || self.session.is_some()), cx)
+                        .bg(gpui::transparent_black()).border_0().rounded_none()
+                        .p_0().w(px(30.)).h_full().flex().items_center().justify_center()
+                        .tooltip(move |_, cx| cx.new(|_| LabelHint(read_hint.clone())).into())
+                        .child(icons::icon(if unread { "icons/mark-read.svg" } else { "icons/mark-unread.svg" }, p.ink_dim)))
+                    .child(self.button(format!("read-archive-{}", row.key), "+", Command::MarkReadArchive(action_ids.clone()), can_stage && (self.demo || self.session.is_some()), cx)
+                        .bg(gpui::transparent_black()).text_color(p.ink_dim)
+                        .border_0().border_l_1().border_r_1().rounded_none()
+                        .p_0().w(px(26.)).h_full().flex().items_center().justify_center()
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered { this.hovered_read_archive = Some(combined_hover_key.clone()); }
+                            else if this.hovered_read_archive.as_ref() == Some(&combined_hover_key) { this.hovered_read_archive = None; }
+                            cx.notify();
+                        }))
+                        .tooltip(move |_, cx| cx.new(|_| LabelHint(read_archive_hint.clone())).into()))
+                    .child(self.button(format!("archive-{}", row.key), "", Command::Stage(action_ids.clone(), Action::Archive), can_stage, cx)
+                        .bg(gpui::transparent_black()).border_0().rounded_none()
+                        .p_0().w(px(30.)).h_full().flex().items_center().justify_center()
+                        .tooltip(move |_, cx| cx.new(|_| LabelHint(archive_hint.clone())).into())
+                        .child(icons::icon("icons/archive.svg", p.ink_dim))))
                 .child(self.button(format!("trash-{}", row.key), "", Command::Stage(action_ids, Action::Trash), can_stage, cx)
                     .bg(p.panel2.opacity(0.35))
                     .p_0().size(px(28.)).flex().items_center().justify_center()
@@ -1613,6 +1662,7 @@ impl MailApp {
             .when(!horizontal, |d| {
                 d.h(px(DIVIDER)).w_full().cursor(CursorStyle::ResizeUpDown)
             })
+            .when(axis == ResizeAxis::ReaderHeight, |d| d.bg(p.line))
             .hover(|s| s.bg(p.accent.opacity(0.15)))
             .focus(|s| s.bg(p.accent.opacity(0.3)))
             .tooltip(move |_, cx| cx.new(|_| Hint(hint)).into())
@@ -2563,28 +2613,22 @@ impl Render for MailApp {
                                 div()
                                     .flex()
                                     .gap_2()
-                                    .child(self.button(
-                                        "rule-archive",
-                                        if action == Action::Archive {
-                                            "[x] Archive"
-                                        } else {
-                                            "[ ] Archive"
-                                        },
-                                        Command::EditAction(Action::Archive),
-                                        true,
-                                        cx,
-                                    ))
-                                    .child(self.button(
-                                        "rule-trash",
-                                        if action == Action::Trash {
-                                            "[x] Trash"
-                                        } else {
-                                            "[ ] Trash"
-                                        },
-                                        Command::EditAction(Action::Trash),
-                                        true,
-                                        cx,
-                                    )),
+                                    .children([
+                                        ("rule-archive", Action::Archive, "icons/archive.svg"),
+                                        ("rule-trash", Action::Trash, "icons/trash.svg"),
+                                    ].into_iter().map(|(id, choice, icon)| {
+                                        let selected = action == choice;
+                                        let color = if selected { p.accent } else { p.ink_dim };
+                                        self.button(id, "", Command::EditAction(choice), true, cx)
+                                            .h(px(36.)).px_3().flex().items_center().gap_2()
+                                            .bg(if selected { p.accent.opacity(0.08) } else { p.panel })
+                                            .border_color(if selected { p.accent } else { p.line })
+                                            .text_color(color)
+                                            .child(icons::icon(icon, color))
+                                            .child(choice.label())
+                                            .child(div().size(px(16.)).flex().items_center().justify_center()
+                                                .when(selected, |d| d.child(icons::icon("icons/check.svg", color))))
+                                    })),
                             )
                             .child(
                                 div()
@@ -2688,6 +2732,31 @@ fn main() {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    #[test]
+    fn hover_darkens_only_the_item_or_its_parent_group() {
+        let p = Palette::default();
+        let rows = triage::demo().rows("");
+        let parent = rows.iter().find(|row| row.header).unwrap();
+        let child = rows.iter().find(|row| row.child).unwrap();
+        let sibling = rows.iter().filter(|row| row.child).nth(1).unwrap();
+        let unrelated = rows.iter().find(|row| !row.child && !row.header).unwrap();
+        let tint = gpui::black().opacity(0.04);
+        for row in [parent, child, unrelated] {
+            let base = if row.child { p.panel2 } else { p.canvas };
+            assert_eq!(row_background(row, None, false, p), base);
+            assert_eq!(row_background(row, Some(&row.key), false, p), base.blend(tint));
+        }
+        for row in [child, sibling] {
+            assert_eq!(row_background(row, Some(&parent.key), false, p), p.panel2.blend(tint));
+        }
+        assert_eq!(row_background(parent, Some(&child.key), false, p), p.canvas);
+        assert_eq!(row_background(sibling, Some(&child.key), false, p), p.panel2);
+        assert_eq!(row_background(unrelated, Some(&parent.key), false, p), p.canvas);
+        let active = p.panel2.blend(p.accent.opacity(0.12));
+        assert_eq!(row_background(child, None, true, p), active);
+        assert_eq!(row_background(child, Some(&child.key), true, p), active.blend(tint));
+        assert_eq!(row_background(child, Some(&parent.key), true, p), active.blend(tint));
+    }
     #[test]
     fn inbox_scrollbar_tracks_overflow_and_clamps_at_both_ends() {
         assert_eq!(scrollbar_thumb(0., 100., 0.), None);

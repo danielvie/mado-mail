@@ -160,11 +160,15 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
         ("archive", true, false), ("trash", true, false),
         ("menu-archive", true, false), ("menu-trash", true, false),
         ("archive", true, true), ("trash", true, true),
+        ("read-archive", true, false), ("read-archive", true, true),
+        ("read-archive", false, false), ("read-archive", false, true),
+        ("read-archive-read", true, false), ("read-archive-read", true, true),
         ("read", false, false), ("unread", false, false),
         ("archive", false, false), ("trash", false, false),
         ("menu-archive", false, false), ("menu-trash", false, false),
     ] {
         let reading = matches!(action, "read" | "unread");
+        let read_archive = action.starts_with("read-archive");
         let target_action = if action.ends_with("trash") { Action::Trash } else { Action::Archive };
         let expected: Vec<String> = if checked { vec!["demo-0", "demo-24", "demo-25"] } else { vec!["demo-24"] }.into_iter().map(str::to_string).collect();
         let before = window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
@@ -172,6 +176,7 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
             app.triage.selection = ["demo-0", "demo-25"].into_iter().map(str::to_string).collect();
             if checked { app.triage.selection.insert("demo-24".into()); }
             if action == "unread" { app.triage.set_read(&["demo-24".into()], true); }
+            if action == "read-archive-read" { app.triage.set_read(&expected, true); }
             app.command(Command::Open("demo-24".into()), window, cx);
             app.cursor = 4; app.hovered_row = Some("m:demo-24".into());
             window.activate_window(); app.table_focus.focus(window); cx.notify();
@@ -198,7 +203,7 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
             window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
                 let bounds = app.row_bounds["m:demo-24"];
-                let pos = point(bounds.right() - px(if reading { 116. } else if action == "archive" { 84. } else { 52. }), bounds.top() + px(18.));
+                let pos = point(bounds.right() - px(if reading { 144. } else if read_archive { 114. } else if action == "archive" { 84. } else { 52. }), bounds.top() + px(18.));
                 window.activate_window();
                 drag(window, pos, pos, pos)
             })??;
@@ -221,7 +226,7 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
                 } else {
                     let email = email.ok_or_else(|| anyhow::anyhow!("{action} removed unexpected message {id}"))?;
                     let mut expected_labels = labels.clone();
-                    if reading && expected.contains(id) {
+                    if (reading || read_archive) && expected.contains(id) {
                         expected_labels.retain(|label| label != "UNREAD");
                         if action == "unread" { expected_labels.push("UNREAD".into()); }
                     }
@@ -235,6 +240,42 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
             }
             let selection = if reading { before.1.clone() } else { before.1.iter().filter(|id| !expected.contains(id)).cloned().collect() };
             ensure!(app.triage.selection == selection, "{action} changed unrelated checkmarks");
+            Ok(())
+        })??;
+    }
+    // Feed mixed write outcomes through the live completion path. No Gmail requests.
+    for (auto, confirmed) in [(false, false), (true, false), (false, true), (true, true)] {
+        this.update(cx, |app, cx| {
+            app.triage = triage::demo(); app.settings.auto_apply = auto;
+            let pending = app.triage.work();
+            let ids: Vec<String> = ["demo-0", "demo-24", "demo-25"].into_iter().map(str::to_string).collect();
+            app.triage.set_read(&ids, false);
+            app.triage.selection = ids.iter().cloned().collect();
+            app.busy = true;
+            app.finish_read(vec![
+                (ids[0].clone(), Ok(Some(crate::Outcome::Confirmed))),
+                (ids[1].clone(), Ok(Some(if confirmed { crate::Outcome::Confirmed } else { crate::Outcome::Failed("Synthetic rejection".into()) }))),
+                (ids[2].clone(), Ok(Some(if confirmed { crate::Outcome::Confirmed } else { crate::Outcome::Unknown("Synthetic timeout".into()) }))),
+            ], true, ids.clone(), cx);
+            if confirmed {
+                ensure!(!app.failed && !app.busy && app.triage.selection.is_empty(), "Confirmed reads did not continue to Archive");
+                for id in &ids {
+                    let email = app.triage.emails.iter().find(|e| &e.id == id);
+                    if auto { ensure!(email.is_none(), "Confirmed target was not archived"); }
+                    else {
+                        ensure!(!email.unwrap().label_ids.contains(&"UNREAD".into()), "Staged Archive is still unread");
+                        ensure!(app.triage.marks[id].action == Action::Archive, "Confirmed target was not staged");
+                    }
+                }
+                ensure!(pending.iter().all(|w| app.triage.work().contains(w)), "Combined action changed unrelated staging");
+            } else {
+                ensure!(app.failed && !app.busy && app.triage.work() == pending && app.status.contains("Nothing archived"), "Read failure continued to Archive, auto={auto}");
+                ensure!(app.triage.selection == ids.iter().cloned().collect(), "Read failure changed checkmarks");
+                for (i, id) in ids.iter().enumerate() {
+                    let email = app.triage.emails.iter().find(|e| &e.id == id).unwrap();
+                    ensure!(email.label_ids.contains(&"UNREAD".into()) == (i != 0), "Unconfirmed read state changed for {id}");
+                }
+            }
             Ok(())
         })??;
     }
@@ -418,7 +459,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             cx.background_executor().timer(Duration::from_millis(150)).await;
             let read_position = window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
-                let pos = point(this.table_bounds.right() - px(116.), this.table_bounds.top() + px(4. * 68. + 18.));
+                let pos = point(this.table_bounds.right() - px(144.), this.table_bounds.top() + px(4. * 68. + 18.));
                 mouse(window, WM_MOUSEMOVE, 0, pos)?; anyhow::Ok(pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
@@ -1033,7 +1074,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             report["middle_selection"] = json!({"clicked_row_state":true,"filter_scope":true,"off_screen_messages":true,"partial_groups":true,"row_controls":true,"mail_unchanged":true});
         }
         if selected_actions_only && report["ok"] == true {
-            report["selected_actions"] = json!({"read_unread":true,"archive_trash":true,"context_menu":true,"unchecked_row_local":true,"auto_apply":true,"preview_preserved":true});
+            report["selected_actions"] = json!({"read_unread":true,"read_archive":true,"read_archive_failures":true,"archive_trash":true,"context_menu":true,"unchecked_row_local":true,"auto_apply":true,"preview_preserved":true});
         }
         if spaces_only && report["ok"] == true {
             report["spaces"] = json!({"inline_create_cancel":true,"fuzzy_keyboard_multiselect":true,"drag_checked_batch":true,"ignores_auto_apply":true,"label_edit_lock":true,"missing_label_blocks_apply":true,"put_back":true,"explicit_apply":true});
