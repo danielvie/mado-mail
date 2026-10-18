@@ -87,6 +87,10 @@ pub(super) async fn check_spaces(window: AnyWindowHandle, this: &gpui::WeakEntit
     window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
         app.command(Command::EditSpace(1), window, cx);
         ensure!(app.space_draft.is_none(), "Pending labels were editable");
+        ensure!(!app.can_remove_space(1), "Pending space was removable");
+        let pending = app.triage.work();
+        app.command(Command::RemoveSpace(1), window, cx);
+        ensure!(app.settings.spaces.len() == 1 && app.triage.work() == pending, "Removal discarded a space with pending mail");
         let removed = app.labels.entries.remove("finance").unwrap();
         app.command(Command::Apply, window, cx);
         ensure!(app.triage.marks.len() == 2 && app.triage.emails.len() == 3, "Missing label failed to block Apply");
@@ -110,6 +114,63 @@ pub(super) async fn check_spaces(window: AnyWindowHandle, this: &gpui::WeakEntit
         Ok(())
     })??;
     capture("space-small-window.png", cx).await?;
+    Ok(())
+}
+
+pub(super) async fn check_space_removal(window: AnyWindowHandle, cx: &mut gpui::AsyncApp) -> Result<()> {
+    window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+        app.triage.marks.clear();
+        app.command(Command::NewSpace, window, cx);
+        app.space_name.update(cx, |input, cx| input.set("Work", cx));
+        app.command(Command::SpaceLabel("projects".into()), window, cx);
+        app.command(Command::SaveSpace, window, cx);
+        ensure!(app.settings.spaces.len() == 1, "Synthetic space failed to save");
+        app.command(Command::EditSpace(1), window, cx);
+        app.command(Command::RemoveSpace(1), window, cx);
+        ensure!(app.settings.spaces.len() == 1 && app.space_draft.is_some(), "Removal ran during a space edit");
+        app.command(Command::CancelSpace, window, cx);
+        let space = app.settings.spaces[0].clone();
+        let id = app.triage.emails[0].id.clone();
+        app.triage.stage_space(&[id.clone()], &space);
+        ensure!(!app.can_remove_space(1), "Pending space was removable");
+        let pending = app.triage.work();
+        app.command(Command::RemoveSpace(1), window, cx);
+        ensure!(app.settings.spaces.len() == 1 && app.triage.work() == pending, "Removal discarded pending mail");
+        app.triage.marks.get_mut(&id).unwrap().outcome = Some(crate::triage::Outcome::Unknown("Synthetic unknown".into()));
+        ensure!(!app.can_remove_space(1), "Unknown submission allowed removal");
+        app.command(Command::RemoveSpace(1), window, cx);
+        ensure!(app.settings.spaces.len() == 1, "Unknown submission lost its space");
+        app.triage.marks.clear();
+        let mut next = app.settings.clone();
+        let mut other = next.spaces[0].clone(); other.id = 2; other.name = "Other".into();
+        next.spaces.push(other.clone());
+        ensure!(app.save_settings(next, cx), "Second synthetic space failed to save");
+        let mail = app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>();
+        let marks = app.triage.work(); let selection = app.triage.selection.clone();
+        let preview = app.active_message.clone(); let rules = app.settings.rules.clone();
+        app.busy = true;
+        ensure!(!app.can_remove_space(1), "Removal enabled during a write");
+        app.command(Command::RemoveSpace(1), window, cx);
+        app.busy = false; app.blocked = true;
+        app.command(Command::RemoveSpace(1), window, cx);
+        app.blocked = false;
+        ensure!(app.settings.spaces.len() == 2, "Blocked removal changed saved spaces");
+        app.labels.unavailable = true;
+        ensure!(app.can_remove_space(1), "Unavailable Gmail labels blocked local space removal");
+        app.command(Command::RemoveSpace(999), window, cx);
+        ensure!(app.settings.spaces.len() == 2, "Missing space removed another space");
+        app.command(Command::RemoveSpace(1), window, cx);
+        ensure!(app.settings.spaces == vec![other] && !app.can_remove_space(1), "Removal changed another custom space");
+        ensure!(app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>() == mail
+            && app.triage.work() == marks && app.triage.selection == selection && app.active_message == preview
+            && app.settings.rules == rules && app.demo && app.session.is_none(), "Space removal changed mail, preview, staging, rules, or reached Gmail");
+        app.labels.unavailable = false;
+        app.command(Command::RemoveSpace(2), window, cx);
+        ensure!(app.settings.spaces.is_empty(), "Last custom space was not removed");
+        Ok(())
+    }))??;
+    cx.background_executor().timer(Duration::from_millis(200)).await;
+    capture("space-removed.png", cx).await?;
     Ok(())
 }
 

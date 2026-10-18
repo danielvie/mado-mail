@@ -45,6 +45,22 @@ impl MailApp {
         else { self.space_name.read(cx).focus_handle.focus(window); }
         cx.notify();
     }
+    pub(super) fn can_remove_space(&self, id: u64) -> bool {
+        !self.busy && !self.blocked && !self.triage.has_unknown() && self.space_draft.is_none()
+            && self.mail_drag.is_none() && self.settings.spaces.iter().any(|space| space.id == id)
+            && !self.triage.marks.values().any(|mark| mark.action == Action::Space(id))
+    }
+    pub(super) fn remove_space(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_remove_space(id) { return; }
+        let mut next = self.settings.clone();
+        next.spaces.retain(|space| space.id != id);
+        if self.save_settings(next, cx) {
+            self.peek = None; self.hovered = None;
+            self.failed = false;
+            self.status = "Space removed locally. Gmail labels and messages are unchanged.".into();
+            self.table_focus.focus(window);
+        }
+    }
     pub(super) fn save_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy || self.blocked || self.triage.has_unknown() { return; }
         let Some(draft) = &self.space_draft else { return; };

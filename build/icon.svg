@@ -1,8 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Mado Mail">
-  <title>Mado Mail, Signal</title>
-  <circle cx="128" cy="128" r="112" fill="#f2f0e8"/>
-  <rect x="56" y="87" width="144" height="102" rx="17" fill="#202524"/>
-  <path d="m64 96 64 49 64-49" fill="none" stroke="#f2f0e8" stroke-width="11" stroke-linejoin="round"/>
-  <circle cx="193" cy="65" r="32" fill="#f2f0e8"/>
-  <circle cx="193" cy="65" r="23" fill="#e26343"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="100%" height="100%">
+  <defs>
+    <linearGradient id="blueGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#1D4ED8"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="52" fill="#0F172A"/>
+
+  <!-- Sender Batch Stack (Top) -->
+  <rect x="68" y="30" width="120" height="64" rx="10" fill="#334155"/>
+  <rect x="58" y="44" width="140" height="68" rx="10" fill="#64748B"/>
+  <rect x="48" y="60" width="160" height="76" rx="12" fill="#F8FAFC"/>
+  <path d="M60 72 L128 114 L196 72" fill="none" stroke="#1E293B" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- The "Mado" Filter Aperture Bar -->
+  <rect x="28" y="130" width="200" height="24" rx="12" fill="url(#blueGlow)" stroke="#93C5FD" stroke-width="3"/>
+
+  <!-- Funnel Convergence Rays -->
+  <polygon points="56,154 200,154 156,204 100,204" fill="#3B82F6" fill-opacity="0.2"/>
+
+  <!-- Distilled Output Badge (Bottom) -->
+  <circle cx="128" cy="202" r="28" fill="#3B82F6"/>
+  <path d="M115 202 L124 211 L143 192" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

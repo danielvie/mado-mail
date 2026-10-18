@@ -344,6 +344,11 @@ mod tests {
         assert!(load_journal(&journal).unwrap()[0].label_ids.is_empty());
         fs::write(&journal, br#"[{"id":"message","action":{"space":1}}]"#).unwrap();
         assert!(load_journal(&journal).is_err());
+        let mut removed = next.clone();
+        removed.spaces.clear();
+        removed.save_config(&path, &next).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), old);
+        assert_eq!(fs::read(rules_path(&path)).unwrap(), rules);
     }
     #[test]
     fn reader_layout_defaults_validates_and_persists_without_changing_other_preferences() {

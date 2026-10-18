@@ -1,6 +1,6 @@
 # App icon
 
-The app uses Signal, concept 8 from the ten-icon comparison. A cream circular badge holds a charcoal envelope and an orange unread dot. The dot is artwork, not a live unread count.
+The app uses the supplied `gemini-svg.svg` artwork. Stacked envelopes sit above a blue filter bar and a checkmark badge on a dark rounded square. The artwork is static, not a live mail indicator.
 
 - `build/icon.svg` is the editable source.
 - `build/icon.ico` is the checked-in Windows icon with 16, 24, 32, 48, 64, 128, and 256 pixel representations.

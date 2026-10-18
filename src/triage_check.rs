@@ -341,7 +341,8 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
         let scrollbar_only = std::env::args().any(|arg| arg == "--scrollbar-only");
         let middle_only = std::env::args().any(|arg| arg == "--middle-only");
         let selected_actions_only = std::env::args().any(|arg| arg == "--selected-actions-only");
-        let spaces_only = std::env::args().any(|arg| arg == "--spaces-only");
+        let spaces_only = std::env::args().any(|arg| arg == "--spaces-only" || arg == "--space-removal-only");
+        let space_removal_only = std::env::args().any(|arg| arg == "--space-removal-only");
         let labels_only = std::env::args().any(|arg| arg == "--labels-only");
         let label_removal_only = std::env::args().any(|arg| arg == "--label-removal-only");
         let reader_visibility_only = std::env::args().any(|arg| arg == "--reader-visibility-only");
@@ -350,6 +351,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             if reader_visibility_only { return check_reader_visibility(window, &this, cx).await; }
             if label_removal_only { return label_check::check_removal(window, &this, cx).await; }
             if labels_only { return label_check::check_labels(window, &this, cx).await; }
+            if space_removal_only { return space_check::check_space_removal(window, cx).await; }
             if spaces_only { return space_check::check_spaces(window, &this, cx).await; }
             if middle_only { return check_middle_selection(window, &this, cx).await; }
             if selected_actions_only { return check_selected_actions(window, &this, cx).await; }
@@ -1077,7 +1079,11 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             report["selected_actions"] = json!({"read_unread":true,"read_archive":true,"read_archive_failures":true,"archive_trash":true,"context_menu":true,"unchecked_row_local":true,"auto_apply":true,"preview_preserved":true});
         }
         if spaces_only && report["ok"] == true {
-            report["spaces"] = json!({"inline_create_cancel":true,"fuzzy_keyboard_multiselect":true,"drag_checked_batch":true,"ignores_auto_apply":true,"label_edit_lock":true,"missing_label_blocks_apply":true,"put_back":true,"explicit_apply":true});
+            report["spaces"] = if space_removal_only {
+                json!({"remove_saved_space":true,"pending_and_unknown_lock":true,"edit_and_write_lock":true,"unavailable_labels":true,"other_spaces_preserved":true,"mail_unchanged":true})
+            } else {
+                json!({"inline_create_cancel":true,"fuzzy_keyboard_multiselect":true,"drag_checked_batch":true,"ignores_auto_apply":true,"label_edit_lock":true,"missing_label_blocks_apply":true,"put_back":true,"explicit_apply":true})
+            };
         }
         if labels_only && report["ok"] == true {
             report["labels"] = json!({"hover_assignment":true,"hover_target_scope":true,"hover_anchor":true,"icon_filter_bar":true,"row_chip_filters":true,"or_labels":true,"idempotent_row_chips":true,"fuzzy_filter":true,"text_intersection":true,"group_scope":true,"remove_filter_keyboard":true,"immediate_assignment":true,"inbox_unread_preserved":true,"partial_results":true,"small_window":true,"floating_picker":true,"no_layout_shift":true,"outside_dismissal":true,"reader_overlay_restore":true});

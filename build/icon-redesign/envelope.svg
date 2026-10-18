@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Mado Mail folded envelope</title>
+  <defs>
+    <clipPath id="envelope">
+      <rect x="16" y="40" width="224" height="176" rx="26"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#envelope)">
+    <rect x="16" y="40" width="224" height="176" fill="#55C6FF"/>
+    <path d="M16 216 L111 132 Q128 117 145 132 L240 216 Z" fill="#2F98F4"/>
+    <path d="M16 40 H240 V63 L139 144 Q128 153 117 144 L16 63 Z" fill="#2583DE"/>
+    <path d="M16 40 H240 V53 L139 134 Q128 143 117 134 L16 53 Z" fill="#F8FCFF"/>
+  </g>
+</svg>

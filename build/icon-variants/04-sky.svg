@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"><title>Mado Mail Sky</title><rect x="3" y="3" width="250" height="250" rx="50" fill="#6ACBFF" stroke="#BEEBFF" stroke-width="3"/>
+<g>
+<rect x="68" y="29" width="120" height="64" rx="10" fill="#2070C7"/>
+<rect x="57" y="44" width="142" height="68" rx="11" fill="#B6E6FF"/>
+<rect x="46" y="61" width="164" height="77" rx="12" fill="#FFFFFF"/>
+<path d="M59 75 L128 116 L197 75" fill="none" stroke="#1761A2" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M54 153 L103 208 L153 208 L202 153 Z" fill="#2F91D8"/>
+<rect x="27" y="132" width="202" height="26" rx="13" fill="#FFFFFF" stroke="#E4F6FF" stroke-width="3"/>
+<circle cx="128" cy="203" r="29" fill="#155BB5"/>
+<path d="M114 203 L124 213 L144 193" fill="none" stroke="#FFFFFF" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</g></svg>

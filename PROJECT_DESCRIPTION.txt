@@ -1,0 +1,15 @@
+Mado Mail
+
+Mado Mail is a Windows desktop application for sorting a personal Gmail Inbox. It focuses on deciding what to keep, archive, move to Trash, or organize with labels. It is not a full email client and does not support composing, replying, forwarding, or browsing attachments.
+
+The app groups messages by sender so users can handle repeated mail in batches. Users can filter the loaded Inbox, preview individual messages, and select messages for action. Opening a preview does not mark a message as read.
+
+By default, Archive and Trash decisions are staged before they change Gmail. Users can review or cancel these pending decisions, then submit them with Apply. Archive removes messages from the Inbox, while Trash moves them to Gmail's Trash rather than permanently deleting them. Both preserve unread status. An optional Auto-apply setting makes Archive and Trash actions immediate.
+
+Saved sender rules help handle recurring mail. Each rule matches part of a sender's address or name and stages an Archive or Trash decision. Saved destinations called spaces apply chosen Gmail labels and remove messages from the Inbox. Space decisions always require Apply. Direct label changes and read/unread changes take effect immediately.
+
+The application is built in Rust with GPUI for its interface. A restricted Microsoft Edge WebView2 reader displays sanitized HTML email. Gmail access uses Google's API and OAuth sign-in, with refresh tokens stored in Windows Credential Manager. Preferences and sender rules are saved locally. A submission journal records submitted actions so interrupted or uncertain Gmail operations can be checked before retrying.
+
+The project replaces an earlier Electron application, with the goal of faster operation and lower memory use while preserving the Inbox-sorting workflow. Those performance improvements have not yet been established through matched measurements.
+
+Mado Mail is intended for personal use on Windows. It loads up to 400 Inbox messages, searches only the loaded content, and does not maintain an offline mailbox. Remote HTTPS images load by default; users can block them for an individual message, but blocking cannot undo requests already sent.

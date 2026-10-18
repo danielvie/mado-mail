@@ -48,7 +48,7 @@ fn row_background(row: &Row, hovered: Option<&str>, active: bool, p: Palette) ->
     let bg = if active { p.panel2.blend(p.accent.opacity(0.12)) } else if row.child { p.panel2 } else { p.canvas };
     let highlighted = hovered.is_some_and(|key| key == row.key
         || (row.child && key.strip_prefix("b:").is_some_and(|sender| sender == sender_address(&row.sender))));
-    if highlighted { bg.blend(gpui::black().opacity(0.04)) } else { bg }
+    if highlighted { bg.blend(gpui::black().opacity(0.015)) } else { bg }
 }
 fn scrollbar_thumb(viewport: f32, content: f32, offset: f32) -> Option<(f32, f32)> {
     if viewport <= 0. || content <= viewport { return None; }
@@ -173,6 +173,7 @@ enum Command {
     ClosePeek,
     NewSpace,
     EditSpace(u64),
+    RemoveSpace(u64),
     SaveSpace,
     CancelSpace,
     SpacePicker,
@@ -976,6 +977,7 @@ impl MailApp {
             Command::CloseLabelPicker => { self.label_picker = None; self.label_row_targets = None; self.table_focus.focus(window); }
             Command::NewSpace => self.edit_space(None, window, cx),
             Command::EditSpace(id) => self.edit_space(Some(id), window, cx),
+            Command::RemoveSpace(id) => self.remove_space(id, window, cx),
             Command::SaveSpace => self.save_space(window, cx),
             Command::CancelSpace => { self.space_draft = None; self.table_focus.focus(window); }
             Command::SpacePicker => {
@@ -1937,7 +1939,16 @@ impl MailApp {
                             } else {
                                 p.danger
                             })
-                            .child(format!("TO {} / {count}", self.action_name(action).to_uppercase())),
+                            .flex().items_center().gap_2()
+                            .child(div().flex_1().min_w_0().truncate().child(format!("TO {} / {count}", self.action_name(action).to_uppercase())))
+                            .when_some(if let Action::Space(id) = action { Some(id) } else { None }, |d, id| {
+                                d.when(self.settings.spaces.iter().any(|space| space.id == id), |d| d.child(
+                                    self.button(format!("remove-space-{id}"), "", Command::RemoveSpace(id), self.can_remove_space(id), cx)
+                                        .flex_shrink_0().flex().items_center().gap_1().text_xs().text_color(p.ink_dim)
+                                        .bg(gpui::transparent_black())
+                                        .tooltip(|_, cx| cx.new(|_| Hint("Remove this local space, not Gmail labels or messages. Apply or put back pending mail first.")).into())
+                                        .child(icons::icon("icons/x.svg", p.ink_dim)).child("Remove space")))
+                            }),
                     )
                     .when_some(if let Action::Space(id) = action { Some(id) } else { None }, |d, id| d.child(self.space_details(id, cx)))
                     .child(div().px_3().py_2().text_xs().text_color(p.ink_dim).child(
@@ -2740,7 +2751,7 @@ mod layout_tests {
         let child = rows.iter().find(|row| row.child).unwrap();
         let sibling = rows.iter().filter(|row| row.child).nth(1).unwrap();
         let unrelated = rows.iter().find(|row| !row.child && !row.header).unwrap();
-        let tint = gpui::black().opacity(0.04);
+        let tint = gpui::black().opacity(0.015);
         for row in [parent, child, unrelated] {
             let base = if row.child { p.panel2 } else { p.canvas };
             assert_eq!(row_background(row, None, false, p), base);
