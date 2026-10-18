@@ -10,9 +10,9 @@ pub struct LabelRemoval {
     pub anchor: Bounds<Pixels>,
 }
 
-fn picker_bounds(anchor: Bounds<Pixels>, viewport: gpui::Size<Pixels>) -> Bounds<Pixels> {
+fn picker_bounds(anchor: Bounds<Pixels>, viewport: gpui::Size<Pixels>, height: f32) -> Bounds<Pixels> {
     let width = 440_f32.min((f32::from(viewport.width) - 16.).max(0.));
-    let height = 340_f32.min((f32::from(viewport.height) - 16.).max(0.));
+    let height = height.min((f32::from(viewport.height) - 16.).max(0.));
     let x = f32::from(anchor.left()).clamp(8., (f32::from(viewport.width) - width - 8.).max(8.));
     let y = (f32::from(anchor.bottom()) + 6.).clamp(8., (f32::from(viewport.height) - height - 8.).max(8.));
     Bounds::new(gpui::point(px(x), px(y)), size(px(width), px(height)))
@@ -151,6 +151,18 @@ impl MailApp {
             if unknown > 0 { "Refresh to check unknown results before retrying." }
             else if failed > 0 { "Failed messages were left unchanged. Retry explicitly." }
             else { "No Apply needed." });
+        if !remove && !confirmed.is_empty() {
+            let mut next = self.settings.clone();
+            let usage = next.label_usage.entry(label.into()).or_default();
+            usage.count = usage.count.saturating_add(1);
+            usage.last_used = labels::usage_time();
+            // History is optional: a save failure must not block mail operations or imply Gmail failed.
+            if self.demo || next.save_config(&self.settings_path, &self.settings).is_ok() {
+                self.settings = next;
+            } else {
+                self.status.push_str(" Quick-label history could not be saved.");
+            }
+        }
         cx.notify();
     }
     pub(super) fn label_picker_key(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -202,7 +214,7 @@ impl MailApp {
     pub(super) fn label_removal_panel(&self, window: &Window, cx: &Context<Self>) -> gpui::Div {
         let Some(removal) = &self.label_removal else { return div(); };
         let p = Palette::current(cx);
-        let bounds = picker_bounds(removal.anchor, window.viewport_size());
+        let bounds = picker_bounds(removal.anchor, window.viewport_size(), 340.);
         let view = cx.weak_entity();
         div().absolute().inset_0().occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| { cx.stop_propagation(); this.command(Command::CancelLabelRemoval, window, cx); }))
@@ -280,7 +292,11 @@ impl MailApp {
             else { format!("Add label / {} checked messages", selected.len()) };
         let anchor = self.label_row_targets.as_ref().and_then(|(key, _)| self.label_row_anchors.get(key)).copied()
             .unwrap_or(self.label_picker_anchors[mode as usize]);
-        let bounds = picker_bounds(anchor, window.viewport_size());
+        let quick = if mode == LabelMode::Assign { labels::quick_labels(&self.labels, &self.settings.label_usage, labels::usage_time()) } else { Vec::new() };
+        let height = if quick.is_empty() { 340. } else {
+            460_f32.min((f32::from(window.viewport_size().height - anchor.bottom()) - 14.).max(340.))
+        };
+        let bounds = picker_bounds(anchor, window.viewport_size(), height);
         let view = cx.weak_entity();
         let panel = div().id("floating-label-picker").absolute().left(bounds.left()).top(bounds.top())
             .w(bounds.size.width).max_h(bounds.size.height).overflow_y_scroll()
@@ -294,6 +310,19 @@ impl MailApp {
                 .child(div().flex_1().min_w_0().child(heading))
                 .child(self.button("close-label-picker", "Close", Command::CloseLabelPicker, true, cx)
                     .bg(p.panel2.opacity(0.35))))
+            .when(!quick.is_empty(), |d| d.child(div().flex().flex_col().flex_shrink_0().gap_1()
+                .child(div().text_xs().text_color(p.ink_dim).child("Quick labels / score"))
+                .child(div().flex().flex_wrap().gap_1().children(quick.iter().map(|(label, score)| {
+                    let count = selected.iter().filter(|id| self.triage.emails.iter().any(|email| &email.id == *id && email.label_ids.contains(&label.id))).count();
+                    let enabled = self.can_stage() && selected.len() > count && (self.demo || self.session.is_some());
+                    let hint = format!("Add {} now. Score {score:.2}, {count}/{} already have label.", label.name, selected.len());
+                    self.button(format!("quick-label-{}", label.id), "", Command::PickTopLabel(label.id.clone()), enabled, cx)
+                        .w(px(((f32::from(bounds.size.width) - 24.) / 2.).max(0.))).min_w_0().text_xs()
+                        .flex().items_center().gap_2().bg(p.panel2.opacity(0.35))
+                        .child(div().flex_1().min_w_0().truncate().child(label.name.clone()))
+                        .child(div().flex_shrink_0().text_color(p.ink_dim).child(format!("{score:.2}")))
+                        .tooltip(move |_, cx| cx.new(|_| LabelHint(hint.clone())).into())
+                })))))
             .child(self.label_query.clone())
             .child(div().text_xs().text_color(p.ink_dim).child(if mode == LabelMode::Assign { "Writes now. Keeps INBOX. Up/Down, Enter to choose." } else { "Combines with text filter. Up/Down, Enter to choose." }))
             .when(self.labels.unavailable, |d| d.child(div().text_color(p.danger).child("Labels unavailable. Cached filters still work; Refresh before assigning.")))
@@ -324,13 +353,13 @@ mod tests {
     #[test]
     fn floating_picker_is_anchored_and_clamped_to_viewport() {
         let anchor = Bounds::new(gpui::point(px(24.), px(90.)), size(px(28.), px(28.)));
-        let bounds = picker_bounds(anchor, size(px(1100.), px(600.)));
+        let bounds = picker_bounds(anchor, size(px(1100.), px(600.)), 340.);
         assert_eq!(bounds.left(), anchor.left());
         assert_eq!(bounds.top(), anchor.bottom() + px(6.));
         for (width, height) in [(1100., 600.), (1480., 850.), (320., 240.)] {
             let viewport = size(px(width), px(height));
             let edge = Bounds::new(gpui::point(px(width - 30.), px(height - 30.)), size(px(28.), px(28.)));
-            let bounds = picker_bounds(edge, viewport);
+            let bounds = picker_bounds(edge, viewport, 460.);
             assert!(bounds.left() >= px(8.) && bounds.top() >= px(8.));
             assert!(bounds.right() <= viewport.width - px(8.) && bounds.bottom() <= viewport.height - px(8.));
         }

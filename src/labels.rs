@@ -1,6 +1,6 @@
 use crate::theme::Palette;
 use gpui::{Hsla, IntoElement, Rgba, div, prelude::*, px};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -26,6 +26,36 @@ pub struct Catalog {
     pub entries: BTreeMap<String, Label>,
     pub unavailable: bool,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Usage {
+    pub count: u64,
+    pub last_used: u64,
+}
+impl Usage {
+    pub fn score(&self, now: u64) -> f64 {
+        // Zoxide's recency weights: https://github.com/ajeetdsouza/zoxide/wiki/Algorithm#frecency
+        self.count as f64 * match now.saturating_sub(self.last_used) {
+            0..3600 => 4.,
+            3600..86400 => 2.,
+            86400..604800 => 0.5,
+            _ => 0.25,
+        }
+    }
+}
+pub fn usage_time() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+pub fn quick_labels<'a>(catalog: &'a Catalog, usage: &BTreeMap<String, Usage>, now: u64) -> Vec<(&'a Label, f64)> {
+    if catalog.unavailable { return Vec::new(); }
+    let mut ranked: Vec<_> = usage.iter().filter(|(_, used)| used.count > 0).filter_map(|(id, used)| {
+        catalog.entries.get(id).filter(|label| label.kind == "user").map(|label| (label, used.score(now)))
+    }).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| (&a.0.name, &a.0.id).cmp(&(&b.0.name, &b.0.id))));
+    ranked.truncate(6);
+    ranked
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Badge {
     pub id: Option<String>,
@@ -103,6 +133,38 @@ pub fn demo() -> Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quick_label_scores_use_frequency_and_recency_with_stable_ties() {
+        let now = 1_000_000;
+        let used = Usage { count: 4, last_used: now };
+        for (age, score) in [(0, 16.), (3599, 16.), (3600, 8.), (86399, 8.), (86400, 2.), (604799, 2.), (604800, 1.)] {
+            assert_eq!(used.score(now + age), score);
+        }
+        assert_eq!(used.score(now - 1), 16.);
+        let mut catalog = demo();
+        let mut usage = BTreeMap::from([
+            ("projects".into(), Usage { count: 10, last_used: now - 604800 }),
+            ("news".into(), Usage { count: 1, last_used: now }),
+            ("finance".into(), Usage { count: 1, last_used: now }),
+            ("hidden".into(), Usage { count: 1, last_used: now - 3600 }),
+            ("missing".into(), Usage { count: 100, last_used: now }),
+            ("INBOX".into(), Usage { count: 100, last_used: now }),
+            ("studies".into(), Usage::default()),
+        ]);
+        let ranked = quick_labels(&catalog, &usage, now);
+        assert_eq!(ranked.iter().map(|(label, score)| (label.id.as_str(), *score)).collect::<Vec<_>>(),
+            vec![("finance", 4.), ("news", 4.), ("projects", 2.5), ("hidden", 2.)]);
+        for i in 0..10 {
+            let mut label = catalog.entries["news"].clone();
+            label.id = format!("extra-{i}");
+            usage.insert(label.id.clone(), used.clone());
+            catalog.entries.insert(label.id.clone(), label);
+        }
+        assert_eq!(quick_labels(&catalog, &usage, now).len(), 6);
+        assert!(quick_labels(&catalog, &BTreeMap::new(), now).is_empty());
+        catalog.unavailable = true;
+        assert!(quick_labels(&catalog, &usage, now).is_empty());
+    }
     #[test]
     fn counts_are_per_message_hide_system_and_hidden_and_keep_unknown() {
         let catalog = demo();

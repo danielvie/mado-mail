@@ -52,6 +52,8 @@ pub struct Settings {
     pub rules: Vec<Rule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spaces: Vec<crate::spaces::Space>,
+    #[serde(default, rename = "labelUsage", skip_serializing_if = "BTreeMap::is_empty")]
+    pub label_usage: BTreeMap<String, crate::labels::Usage>,
     #[serde(rename = "autoApply")]
     pub auto_apply: bool,
     pub theme: String,
@@ -72,6 +74,7 @@ impl Default for Settings {
             version: 1,
             rules: Vec::new(),
             spaces: Vec::new(),
+            label_usage: BTreeMap::new(),
             auto_apply: false,
             theme: "frost".into(),
             themes: BTreeMap::from([("frost".into(), Palette::default())]),
@@ -111,6 +114,11 @@ impl Settings {
         ensure!((240..=8192).contains(&s.reader_height), "Reader height must be 240..8192");
         validate_rules(&s.rules)?;
         crate::spaces::validate(&s.spaces)?;
+        ensure!(s.label_usage.len() <= 10000, "Too many quick-label history entries");
+        for (id, usage) in &s.label_usage {
+            crate::spaces::validate_labels(std::slice::from_ref(id))?;
+            ensure!(usage.count > 0, "Quick-label use count must be positive");
+        }
         Ok(s)
     }
     pub fn load(path: &Path) -> Result<Self> {
@@ -171,6 +179,7 @@ impl Settings {
             || normalized.reader_position != previous.reader_position
             || normalized.reader_height != previous.reader_height
             || normalized.spaces != previous.spaces
+            || normalized.label_usage != previous.label_usage
             || !path.exists()
         {
             normalized.save_preferences(path)?;
@@ -312,6 +321,27 @@ pub fn load_journal(path: &Path) -> Result<Vec<Work>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quick_label_history_defaults_validates_and_persists_without_changing_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let old = Settings::decode(br#"{"version":1,"autoApply":false,"theme":"frost"}"#).unwrap();
+        assert!(old.label_usage.is_empty());
+        old.save_config(&path, &old).unwrap();
+        let rules = fs::read(rules_path(&path)).unwrap();
+        let mut next = old.clone();
+        next.label_usage.insert("projects".into(), crate::labels::Usage { count: 3, last_used: 1_000_000 });
+        next.save_config(&path, &old).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), next);
+        assert_eq!(fs::read(rules_path(&path)).unwrap(), rules);
+        let saved = fs::read(&path).unwrap();
+        for (id, count) in [("INBOX", 1), ("", 1), ("projects", 0)] {
+            let mut invalid = old.clone();
+            invalid.label_usage.insert(id.into(), crate::labels::Usage { count, last_used: 0 });
+            assert!(invalid.save_config(&path, &next).is_err());
+            assert_eq!(fs::read(&path).unwrap(), saved);
+        }
+    }
     #[test]
     fn spaces_persist_without_changing_rules_and_journals_keep_label_snapshots() {
         let dir = tempfile::tempdir().unwrap();

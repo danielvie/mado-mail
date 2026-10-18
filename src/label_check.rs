@@ -145,6 +145,66 @@ pub(super) async fn check_labels(window: AnyWindowHandle, this: &gpui::WeakEntit
         cx.background_executor().timer(Duration::from_millis(250)).await;
         ensure!(visible(&browser)?, "Closing picker failed to restore native reader");
     }
+    check_quick_labels(window, this, cx).await?;
+    Ok(())
+}
+
+async fn check_quick_labels(window: AnyWindowHandle, this: &gpui::WeakEntity<MailApp>, cx: &mut gpui::AsyncApp) -> Result<()> {
+    let baseline = window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+        if app.reader_visible { app.command(Command::ToggleReader, window, cx); }
+        app.triage = crate::triage::demo();
+        for email in &mut app.triage.emails { email.label_ids.push("INBOX".into()); }
+        app.settings.label_usage.clear();
+        app.finish_label_change("projects", vec![("demo-12".into(), Outcome::Confirmed), ("demo-13".into(), Outcome::Confirmed)], false, cx);
+        ensure!(app.settings.label_usage["projects"].count == 1, "Batch size inflated quick-label frequency");
+        let now = crate::labels::usage_time();
+        for id in ["news", "studies", "finance", "hidden"] {
+            app.settings.label_usage.insert(id.into(), crate::labels::Usage { count: 1, last_used: now - 3600 });
+        }
+        app.triage.selection = ["demo-14".into(), "demo-15".into()].into_iter().collect();
+        app.command(Command::TopLabelPicker(LabelMode::Assign), window, cx);
+        // Quick labels are independent of the fuzzy query.
+        app.label_query.update(cx, |input, cx| input.set("nws", cx));
+        Ok((app.triage.work(), app.triage.selection.clone(), app.active_message.clone(), app.settings.label_usage.clone()))
+    }))??;
+    cx.background_executor().timer(Duration::from_millis(300)).await;
+    capture("label-quick-before.png", cx).await?;
+    let click = |window: &mut gpui::Window, pos| -> Result<()> {
+        mouse(window, WM_MOUSEMOVE, 0, pos)?;
+        mouse(window, WM_LBUTTONDOWN, 1, pos)?;
+        mouse(window, WM_LBUTTONUP, 0, pos)
+    };
+    let pos = this.update(cx, |app, _| point(app.label_picker_bounds.left() + px(32.), app.label_picker_bounds.top() + px(84.)))?;
+    window.update(cx, |_, window, _| click(window, pos))??;
+    cx.background_executor().timer(Duration::from_millis(200)).await;
+    this.update(cx, |app, _| {
+        ensure!(app.settings.label_usage["projects"].count == 2, "Clicking a quick label did not record one use");
+        for id in ["demo-14", "demo-15"] {
+            let email = app.triage.emails.iter().find(|email| email.id == id).unwrap();
+            ensure!(email.label_ids.contains(&"projects".into()) && email.label_ids.contains(&"INBOX".into()), "Quick label missed targets or removed INBOX");
+        }
+        ensure!(app.triage.work() == baseline.0 && app.triage.selection == baseline.1 && app.active_message == baseline.2, "Quick label changed staging, selection, or preview");
+        for id in ["news", "studies", "finance", "hidden"] {
+            ensure!(app.settings.label_usage[id] == baseline.3[id], "Quick label changed another label's score");
+        }
+        Ok(())
+    })??;
+    // Already-applied shortcuts are disabled, not toggles or extra frequency events.
+    window.update(cx, |_, window, _| click(window, pos))??;
+    capture("label-quick-after.png", cx).await?;
+    window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+        let history = app.settings.label_usage.clone();
+        app.command(Command::PickTopLabel("projects".into()), window, cx);
+        app.finish_label_change("projects", vec![("demo-16".into(), Outcome::Failed("rejected".into())), ("demo-17".into(), Outcome::Unknown("timeout".into()))], false, cx);
+        app.finish_label_change("projects", vec![("demo-14".into(), Outcome::Confirmed)], true, cx);
+        app.command(Command::CloseLabelPicker, window, cx);
+        app.command(Command::TopLabelPicker(LabelMode::Filter), window, cx);
+        app.command(Command::PickTopLabel("projects".into()), window, cx);
+        ensure!(app.settings.label_usage == history, "No-op, failed, unknown, removed, or filtered label changed frequency");
+        ensure!(app.demo && app.session.is_none(), "Quick-label check reached Gmail");
+        app.command(Command::CloseLabelPicker, window, cx);
+        Ok(())
+    }))??;
     Ok(())
 }
 
