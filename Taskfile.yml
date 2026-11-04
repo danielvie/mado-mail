@@ -27,6 +27,10 @@ tasks:
         New-Item -ItemType Directory -Force "$HOME/.local/bin" | Out-Null;
         Copy-Item "target/release/mado-mail.exe" "$HOME/.local/bin/mado-mail.exe" -Force'
 
+  check:
+    desc: Check all Rust targets against the locked dependencies
+    cmds: [cargo check --all-targets --locked]
+
   test:
     desc: Run Rust tests
     cmds: [cargo test]

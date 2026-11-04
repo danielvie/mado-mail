@@ -63,6 +63,8 @@ pub struct Settings {
     pub pane_widths: PaneWidths,
     #[serde(default, rename = "paneVisibility")]
     pub pane_visibility: PaneVisibility,
+    #[serde(default, rename = "stagingReviewOpen")]
+    pub staging_review_open: bool,
     #[serde(default, rename = "readerPosition")]
     pub reader_position: ReaderPosition,
     #[serde(default = "default_reader_height", rename = "readerHeight")]
@@ -80,6 +82,7 @@ impl Default for Settings {
             themes: BTreeMap::from([("frost".into(), Palette::default())]),
             pane_widths: PaneWidths::default(),
             pane_visibility: PaneVisibility::default(),
+            staging_review_open: false,
             reader_position: ReaderPosition::default(),
             reader_height: default_reader_height(),
         }
@@ -176,6 +179,7 @@ impl Settings {
             || normalized.themes != previous.themes
             || normalized.pane_widths != previous.pane_widths
             || normalized.pane_visibility != previous.pane_visibility
+            || normalized.staging_review_open != previous.staging_review_open
             || normalized.reader_position != previous.reader_position
             || normalized.reader_height != previous.reader_height
             || normalized.spaces != previous.spaces
@@ -205,6 +209,16 @@ impl Settings {
             .collect()
     }
 }
+/// Reload only color values; external edits must not enable mail actions or move panes.
+pub fn load_colors(path: &Path, theme: &str) -> Result<Palette> {
+    let value: serde_json::Value = serde_json::from_slice(&read_bounded(path)?)
+        .context("Invalid settings JSON")?;
+    let colors = value.get("themes").and_then(|themes| themes.get(theme))
+        .with_context(|| format!("Selected theme '{theme}' is missing from settings"))?;
+    serde_json::from_value(colors.clone())
+        .with_context(|| format!("Invalid colors for theme '{theme}'"))
+}
+
 pub fn rules_path(settings_path: &Path) -> PathBuf {
     settings_path.with_file_name("rules.json")
 }
@@ -322,6 +336,61 @@ pub fn load_journal(path: &Path) -> Result<Vec<Work>> {
 mod tests {
     use super::*;
     #[test]
+    fn color_reload_ignores_non_color_edits_and_survives_a_later_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let previous = Settings::default();
+        previous.save_config(&path, &previous).unwrap();
+        let rules = fs::read(rules_path(&path)).unwrap();
+        let edited = br##"{"theme":"other","autoApply":true,"rules":[{"id":"x","from":"x","action":"trash"}],"paneWidths":{"reader":800,"staging":500},"themes":{"frost":{"header_background":"#233044","accent":"#087f5b"},"other":{"accent":"invalid"}}}"##;
+        fs::write(&path, edited).unwrap();
+        let colors = load_colors(&path, &previous.theme).unwrap();
+        assert_eq!(colors.header().canvas, gpui::rgb(0x233044).into());
+        assert_eq!(colors.accent, gpui::rgb(0x087f5b).into());
+        assert_eq!(colors.canvas, Palette::default().canvas);
+        assert_eq!(fs::read(&path).unwrap(), edited);
+        assert_eq!(fs::read(rules_path(&path)).unwrap(), rules);
+        let mut next = previous.clone();
+        next.themes.insert(next.theme.clone(), colors);
+        next.save_config(&path, &previous).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), next);
+        assert!(!next.auto_apply && next.rules.is_empty());
+        assert_eq!(next.pane_widths, previous.pane_widths);
+        assert_eq!(next.theme, previous.theme);
+        assert_eq!(fs::read(rules_path(&path)).unwrap(), rules);
+    }
+    #[test]
+    fn color_reload_rejects_bad_files_and_recovers_without_rewriting_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(load_colors(&path, "frost").is_err());
+        for invalid in [
+            "{", "{}", r#"{"themes":{"other":{}}}"#,
+            r#"{"themes":{"frost":null}}"#,
+            r#"{"themes":{"frost":{"header_background":"invalid"}}}"#,
+            r##"{"themes":{"frost":{"unknown":"#233044"}}}"##,
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(load_colors(&path, "frost").is_err());
+            assert_eq!(fs::read(&path).unwrap(), invalid.as_bytes());
+        }
+        fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(load_colors(&path, "frost").is_err());
+        fs::write(&path, br#"{"themes":{"frost":{}}}"#).unwrap();
+        assert_eq!(load_colors(&path, "frost").unwrap(), Palette::default());
+    }
+    #[test]
+    fn color_reload_reopens_atomically_replaced_files_even_with_same_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for color in ["#233044", "#344455", "#233044"] {
+            let json = format!(r#"{{"themes":{{"frost":{{"header_background":"{color}"}}}}}}"#);
+            atomic_write(&path, json.as_bytes()).unwrap();
+            let expected: Palette = serde_json::from_str(&format!(r#"{{"header_background":"{color}"}}"#)).unwrap();
+            assert_eq!(load_colors(&path, "frost").unwrap(), expected);
+        }
+    }
+    #[test]
     fn quick_label_history_defaults_validates_and_persists_without_changing_rules() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -410,6 +479,45 @@ mod tests {
         assert!(Settings::decode(br#"{"version":1,"autoApply":false,"theme":"frost","readerPosition":"left"}"#).is_err());
     }
     #[test]
+    fn staging_review_defaults_round_trips_and_rejects_nonbooleans_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let legacy = dir.path().join("gpui-settings.json");
+        let original = br##"{"version":1,"autoApply":true,"theme":"custom","themes":{"custom":{"accent":"#087f5b"}},"paneWidths":{"reader":610,"staging":390},"paneVisibility":{"reader":true,"staging":true},"readerPosition":"below","readerHeight":416,"spaces":[{"id":1,"name":"Work","label_ids":["projects"]}],"labelUsage":{"projects":{"count":3,"lastUsed":1000000}},"rules":[{"id":"b","from":"B","action":"trash"},{"id":"a","from":"A","action":"archive"}]}"##;
+        fs::write(&legacy, original).unwrap();
+        let baseline = Settings::load_or_migrate(&path, &legacy).unwrap();
+        assert!(baseline.pane_visibility.staging);
+        assert!(!baseline.staging_review_open);
+        assert!(!Settings::default().staging_review_open);
+        let rules = fs::read(rules_path(&path)).unwrap();
+        let mut previous = baseline.clone();
+        for open in [true, false] {
+            let mut next = previous.clone();
+            next.staging_review_open = open;
+            next.save_config(&path, &previous).unwrap();
+            let restored = Settings::load_or_migrate(&path, &legacy).unwrap();
+            assert_eq!(restored, next);
+            let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["stagingReviewOpen"], serde_json::json!(open));
+            let mut unchanged = restored.clone();
+            unchanged.staging_review_open = false;
+            assert_eq!(unchanged, baseline);
+            assert_eq!(fs::read(rules_path(&path)).unwrap(), rules);
+            previous = restored;
+        }
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for invalid in [serde_json::json!("true"), serde_json::json!(1), serde_json::Value::Null] {
+            let mut edited = saved.clone();
+            edited["stagingReviewOpen"] = invalid;
+            let bytes = serde_json::to_vec(&edited).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(Settings::load_or_migrate(&path, &legacy).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(rules_path(&path)).unwrap(), rules);
+        }
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+    }
+    #[test]
     fn pane_visibility_restores_all_states_without_changing_widths_or_rules() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -452,10 +560,11 @@ mod tests {
     #[test]
     fn frost_is_the_only_builtin_and_custom_themes_round_trip() {
         assert_eq!(Settings::default().theme_names(), vec!["frost"]);
-        let custom = Settings::decode(br##"{"version":1,"rules":[],"autoApply":false,"theme":"ocean","themes":{"ocean":{"accent":"#087f5b","panel":"#e6f7ef"}}}"##).unwrap();
+        let custom = Settings::decode(br##"{"version":1,"rules":[],"autoApply":false,"theme":"ocean","themes":{"ocean":{"accent":"#087f5b","panel":"#e6f7ef","header_background":"#233044"}}}"##).unwrap();
         assert_eq!(custom.theme_names(), vec!["frost", "ocean"]);
         assert_eq!(custom.palette().accent, gpui::rgb(0x087f5b).into());
         assert_eq!(custom.palette().canvas, Palette::default().canvas);
+        assert_eq!(custom.palette().header().canvas, gpui::rgb(0x233044).into());
         assert_eq!(
             Settings::decode(&serde_json::to_vec(&custom).unwrap()).unwrap(),
             custom
@@ -471,7 +580,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let original = br##"{"version":1,"autoApply":true,"theme":"frost","themes":{"frost":{"panel2":"#ddeeff"}},"paneWidths":{"reader":610,"staging":390}}"##;
-        fs::write(&path, original).unwrap();
+        let mut original = serde_json::to_value(Settings::decode(original).unwrap()).unwrap();
+        original["themes"]["frost"].as_object_mut().unwrap().remove("header_background");
+        let original = serde_json::to_vec(&original).unwrap();
+        fs::write(&path, &original).unwrap();
         let settings = Settings::load_or_migrate(&path, &dir.path().join("gpui-settings.json")).unwrap();
         assert_eq!(settings.palette().panel2, gpui::rgb(0xddeeff).into());
         assert_eq!(settings.palette().canvas, Palette::default().canvas);
@@ -479,7 +591,9 @@ mod tests {
         assert!(settings.auto_apply);
         assert_eq!(settings.pane_widths.reader, 610);
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved["themes"]["frost"].as_object().unwrap().len(), 9);
+        assert_eq!(saved["themes"]["frost"].as_object().unwrap().len(), 10);
+        assert_eq!(settings.palette().header().canvas, gpui::rgb(0x1b2230).into());
+        assert_eq!(saved["themes"]["frost"]["header_background"], "#1b2230ff");
         let before = fs::read(&path).unwrap();
         let count = fs::read_dir(dir.path()).unwrap().count();
         Settings::load_or_migrate(&path, &dir.path().join("gpui-settings.json")).unwrap();
@@ -490,6 +604,11 @@ mod tests {
             entry.file_name().to_string_lossy().starts_with("settings.backup-")
                 && fs::read(entry.path()).unwrap() == original
         }));
+        let mut custom = settings.clone();
+        custom.themes.get_mut("frost").unwrap().header_background = gpui::rgb(0x233044).into();
+        custom.save_config(&path, &settings).unwrap();
+        assert_eq!(Settings::load_or_migrate(&path, &dir.path().join("gpui-settings.json")).unwrap(), custom);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), count);
         assert_eq!(config_path().unwrap(), directory().unwrap().join("settings.json"));
         assert!(directory().unwrap().ends_with(".mado/mado-mail"));
     }

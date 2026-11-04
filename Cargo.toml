@@ -13,7 +13,8 @@ ammonia = "=4.2.0"
 base64 = "0.22"
 encoding_rs = "0.8"
 futures = "0.3"
-gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false, features = ["windows-manifest"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", default-features = false }
 keyring = "=4.2.0"
 oauth2 = { version = "=5.0.0", default-features = false, features = ["reqwest-blocking", "rustls-tls", "timing-resistant-secret-traits"] }
 percent-encoding = "2"

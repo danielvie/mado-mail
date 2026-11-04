@@ -10,7 +10,7 @@ use wry::{WebView, WebViewExtWindows};
 async fn ready(reader: &Entity<Reader>, cx: &mut AsyncApp) -> Result<Rc<WebView>> {
     for _ in 0..60 {
         cx.background_executor().timer(Duration::from_millis(100)).await;
-        let browser = reader.update(cx, |r, _| (r.loaded && r.page_ready).then(|| r.browser()).flatten())?;
+        let browser = reader.update(cx, |r, _| (r.loaded && r.page_ready).then(|| r.browser()).flatten());
         if let Some(browser) = browser {
             let mut visible = false.into();
             unsafe { browser.controller().IsVisible(&mut visible)?; }
@@ -23,7 +23,7 @@ async fn ready(reader: &Entity<Reader>, cx: &mut AsyncApp) -> Result<Rc<WebView>
 async fn detached(cx: &mut AsyncApp) -> Result<WindowHandle<Reader>> {
     for _ in 0..40 {
         cx.background_executor().timer(Duration::from_millis(100)).await;
-        if let Some(window) = cx.update(|cx| cx.windows().into_iter().find_map(|w| w.downcast::<Reader>()))? {
+        if let Some(window) = cx.update(|cx| cx.windows().into_iter().find_map(|w| w.downcast::<Reader>())) {
             return Ok(window);
         }
     }
@@ -41,8 +41,8 @@ pub fn start(inbox: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 ensure!(!r.can_detach(), "Empty reader can detach");
                 r.detach(cx);
                 Ok(())
-            })??;
-            ensure!(cx.update(|cx| cx.windows().len())? == 1, "Empty reader opened a window");
+            })?;
+            ensure!(cx.update(|cx| cx.windows().len()) == 1, "Empty reader opened a window");
             let mail_before = this.update(cx, |app, _| (
                 app.triage.work(), app.triage.selection.clone(),
                 app.triage.emails.iter().map(|e| (e.id.clone(), e.label_ids.clone())).collect::<Vec<_>>(),
@@ -58,18 +58,18 @@ pub fn start(inbox: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 doc.html = doc.html.replace("Your membership has been renewed", "Pinned first message");
                 drop(doc);
                 r.toggle_images(cx);
-            })?;
+            });
             ready(&source, cx).await?;
             source_browser.evaluate_script("window.scrollTo(0,80)")?;
             let before = reader_check::probe(&source_browser).await?;
             let snapshot = source.update(cx, |r, _| (
                 r.email.id.clone(), r.email.subject.clone(), r.labels.clone(), r.document.read().unwrap().html.clone(),
-            ))?;
+            ));
             let preferences = this.update(cx, |app, _| app.settings.clone())?;
             // Tab-focusable SVG button uses the same command for click, Enter, and Space.
             inbox.update(cx, |_, window, cx| {
                 window.activate_window();
-                source.read(cx).detach_focus.focus(window);
+                source.read(cx).detach_focus.clone().focus(window, cx);
                 window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
             })?;
             let popout = detached(cx).await?;
@@ -93,7 +93,7 @@ pub fn start(inbox: AnyWindowHandle, cx: &mut Context<MailApp>) {
             ready(&popout_entity, cx).await?;
             ensure!(reader_check::probe(&popout_browser).await?["remote"].as_u64().unwrap_or_default() > 0,
                 "Detached image control did not work");
-            source.update(cx, |r, _| { ensure!(!r.document.read().unwrap().remote, "Detached image toggle changed the inline reader"); Ok(()) })??;
+            source.update(cx, |r, _| { ensure!(!r.document.read().unwrap().remote, "Detached image toggle changed the inline reader"); Ok(()) })?;
             // Browsing another message and switching to Rules must not replace or hide the pop-out.
             inbox.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
                 let id = app.triage.emails[1].id.clone();
@@ -114,7 +114,7 @@ pub fn start(inbox: AnyWindowHandle, cx: &mut Context<MailApp>) {
             drop(popout_entity);
             popout.update(cx, |_, window, _| window.remove_window())?;
             cx.background_executor().timer(Duration::from_millis(300)).await;
-            ensure!(cx.update(|cx| cx.windows().len())? == 1, "Closing detached reader closed the Inbox or retained a window");
+            ensure!(cx.update(|cx| cx.windows().len()) == 1, "Closing detached reader closed the Inbox or retained a window");
             // A second pop-out pins the new message; Space activates the same SVG in the below layout.
             inbox.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
                 window.activate_window();
@@ -123,7 +123,7 @@ pub fn start(inbox: AnyWindowHandle, cx: &mut Context<MailApp>) {
             }))?;
             ready(&source, cx).await?;
             inbox.update(cx, |_, window, cx| {
-                source.read(cx).detach_focus.focus(window);
+                source.read(cx).detach_focus.clone().focus(window, cx);
                 window.dispatch_keystroke(Keystroke::parse("space").unwrap(), cx);
             })?;
             let second = detached(cx).await?;
@@ -139,7 +139,7 @@ pub fn start(inbox: AnyWindowHandle, cx: &mut Context<MailApp>) {
             drop(source);
             inbox.update(cx, |_, window, _| window.remove_window())?;
             cx.background_executor().timer(Duration::from_millis(300)).await;
-            ensure!(cx.update(|cx| cx.windows().len())? == 1, "Closing Inbox closed the pinned reader");
+            ensure!(cx.update(|cx| cx.windows().len()) == 1, "Closing Inbox closed the pinned reader");
             ready(&second_entity, cx).await?;
             ensure!(reader_check::probe(&second_browser).await?["ready"] == "complete", "Pinned reader stopped after Inbox closed");
             Ok(())

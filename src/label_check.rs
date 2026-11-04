@@ -6,18 +6,18 @@ pub(super) async fn check_labels(window: AnyWindowHandle, this: &gpui::WeakEntit
     check_hover_assignment(window, this, cx).await?;
     check_row_labels(window, this, cx).await?;
     check_floating_pickers(window, this, cx).await?;
-    let original = window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, _| {
+    let original = window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
         window.activate_window();
         for email in &mut app.triage.emails { email.label_ids.push("INBOX".into()); }
         let original = app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>();
         app.triage.selection.insert("demo-0".into());
-        app.table_focus.focus(window);
+        app.table_focus.focus(window, cx);
         original
     }))?;
     cx.background_executor().timer(Duration::from_millis(250)).await;
     // With no active chips, the icon-only label control is immediately before the table.
     window.update(cx, |_, window, cx| {
-        window.focus_prev();
+        window.focus_prev(cx);
         window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
     })?;
     window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
@@ -55,8 +55,8 @@ pub(super) async fn check_labels(window: AnyWindowHandle, this: &gpui::WeakEntit
     cx.background_executor().timer(Duration::from_millis(200)).await;
     // The remove badge is a real tab stop and becomes visible on keyboard focus.
     window.update(cx, |root, window, cx| {
-        root.downcast::<MailApp>().unwrap().read(cx).table_focus.focus(window);
-        window.focus_prev();
+        root.downcast::<MailApp>().unwrap().read(cx).table_focus.clone().focus(window, cx);
+        window.focus_prev(cx);
     })?;
     cx.background_executor().timer(Duration::from_millis(200)).await;
     capture("label-filter-remove.png", cx).await?;
@@ -222,7 +222,7 @@ async fn check_hover_assignment(window: AnyWindowHandle, this: &gpui::WeakEntity
             app.triage.selection = checked.iter().map(|id| id.to_string()).collect();
             app.cursor = app.triage.rows("").iter().position(|row| row.key == key).unwrap();
             app.hovered_row = Some(key.into());
-            app.table_focus.focus(window); window.activate_window(); cx.notify();
+            app.table_focus.focus(window, cx); window.activate_window(); cx.notify();
             (app.triage.emails.iter().map(|email| email.label_ids.clone()).collect::<Vec<_>>(), app.triage.work(), app.triage.selection.clone())
         }))?;
         cx.background_executor().timer(Duration::from_millis(400)).await;
@@ -234,8 +234,8 @@ async fn check_hover_assignment(window: AnyWindowHandle, this: &gpui::WeakEntity
                 let badges = app.row_labels(&row);
                 let budget = ((f32::from(app.table_bounds.size.width) - 90.) * 0.4).clamp(34., 220.);
                 let chips = badges.iter().take(crate::labels::visible_count(badges.len(), budget)).filter(|badge| badge.id.is_some()).count();
-                app.label_focus[key].focus(window);
-                for _ in 0..chips * 2 + 1 { window.focus_next(); }
+                app.label_focus[key].clone().focus(window, cx);
+                for _ in 0..chips * 2 + 1 { window.focus_next(cx); }
                 window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
             })?;
         } else {
@@ -347,8 +347,8 @@ pub(super) async fn check_removal(window: AnyWindowHandle, this: &gpui::WeakEnti
     let layout = this.update(cx, |app, _| (app.table_bounds, app.bin_bounds))?;
     // The name and remove badge are separate tab stops. Finance is the second chip.
     window.update(cx, |root, window, cx| {
-        root.downcast::<MailApp>().unwrap().read(cx).label_focus["b:ada.chen@example.test"].focus(window);
-        for _ in 0..4 { window.focus_next(); }
+        root.downcast::<MailApp>().unwrap().read(cx).label_focus["b:ada.chen@example.test"].clone().focus(window, cx);
+        for _ in 0..4 { window.focus_next(cx); }
         window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
     })?;
     cx.background_executor().timer(Duration::from_millis(250)).await;
@@ -382,8 +382,8 @@ pub(super) async fn check_removal(window: AnyWindowHandle, this: &gpui::WeakEnti
     })??;
     cx.background_executor().timer(Duration::from_millis(250)).await;
     window.update(cx, |root, window, cx| {
-        root.downcast::<MailApp>().unwrap().read(cx).label_focus["m:demo-24"].focus(window);
-        window.focus_next(); window.focus_next();
+        root.downcast::<MailApp>().unwrap().read(cx).label_focus["m:demo-24"].clone().focus(window, cx);
+        window.focus_next(cx); window.focus_next(cx);
     })?;
     capture("label-remove-badge.png", cx).await?;
     window.update(cx, |_, window, cx| { window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx); })?;
@@ -471,8 +471,8 @@ async fn check_row_labels(window: AnyWindowHandle, this: &gpui::WeakEntity<MailA
     // Individual chips are keyboard controls; activating an already active one does not remove it.
     window.update(cx, |root, window, cx| {
         let view = root.downcast::<MailApp>().unwrap();
-        view.read(cx).label_focus[key].focus(window);
-        window.focus_next();
+        view.read(cx).label_focus[key].clone().focus(window, cx);
+        window.focus_next(cx);
         window.dispatch_keystroke(Keystroke::parse("space").unwrap(), cx);
     })?;
     window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {

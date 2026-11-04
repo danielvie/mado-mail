@@ -16,6 +16,7 @@ task run           # Build and launch with Gmail
 task demo          # Synthetic Inbox, no Gmail access or personal settings writes
 task build         # Release executable in target/release/mado-mail.exe
 task install       # Build release and copy mado-mail.exe to ~/.local/bin
+task check         # Check all Rust targets with locked dependencies
 task test          # Model, settings, OAuth, MIME, and synthetic HTTP tests
 task clean         # Remove Rust build artifacts
 task --list        # List tasks
@@ -37,6 +38,8 @@ Refresh tokens use Windows Credential Manager. Settings, sender rules, and submi
 - [Application guide](docs/application.md): controls, settings, recovery, and checks.
 - [Project overview](docs/project-overview.md): workflows, architecture, and limitations.
 - [Code context](CONTEXT.md): module responsibilities and triage terminology.
+- [GPUI snapshot decision](docs/adr/0002-gpui-pre.md): pinned packages, native startup, and update requirements.
+- [GPUI migration results](docs/research/gpui-pre-migration.md): compatibility changes, native check repairs, and verification limits.
 - [App icon](docs/app-icon.md): Windows icon assets.
 
 Design, research, and `docs/history/` documents retain migration history, including paths and names from earlier snapshots. Matched speed and total-memory comparisons against the former Electron app have not been performed.

@@ -7,6 +7,7 @@ Windows Gmail triage app built with Rust and GPUI. The repository root is a sing
 ```text
 task run           # Build and launch with Gmail
 task demo          # Synthetic Inbox; no credentials, network, or settings writes
+task check         # All Rust targets with locked dependencies
 task test          # Model, settings, OAuth, MIME, and synthetic HTTP tests
 task build         # target/release/mado-mail.exe
 task install       # Build release and copy mado-mail.exe to ~/.local/bin
@@ -25,10 +26,13 @@ Run the scripts directly after building:
 task build
 powershell.exe -NoProfile -File scripts/check-triage.ps1
 powershell.exe -NoProfile -File scripts/check-reader.ps1
+powershell.exe -NoProfile -File scripts/check-colors.ps1
 powershell.exe -NoProfile -File scripts/check-window.ps1 -Demo
 ```
 
 For focused triage checks, run `cargo build`, then invoke `scripts/check-triage.ps1` with `-DebugBuild` and one switch: `-ScrollbarOnly`, `-DetachOnly`, `-MiddleOnly`, `-SelectedActionsOnly`, `-SpacesOnly`, `-LabelsOnly`, `-ReaderVisibilityOnly`, or `-LabelRemovalOnly`.
+
+For color hot reload, `cargo build` followed by `powershell.exe -NoProfile -File scripts/check-colors.ps1 -DebugBuild` runs an isolated check with temporary settings and synthetic mail. It checks live updates, invalid files, recovery, stale reads, unchanged mail/preferences, saved colors, and task cancellation. The report is `target/color-check.json`; a window capture is `target/color-reload.png`.
 
 ## Gmail connection
 
@@ -43,9 +47,9 @@ To forget authorization, close the app and remove only its `mado-mail/gmail.modi
 
 ## Triage
 
-The top toolbar contains the message filter, Run query, Rules, Refresh, checked-message actions, Auto-apply, and Theme. Label filtering has its own row below the status message. Sender groups are ordered by count, then address. Click a group to expand it and expose individual messages. Filtering searches From, Subject, and snippet. When the filter contains text, an SVG X appears inside its right edge. Click it, or focus it with Tab and press Enter or Space, to clear the filter and return input focus. It disappears when empty; Ctrl+Z restores the cleared text.
+The top toolbar contains the message filter, Run query, Rules, Refresh, checked-message actions, a persistent Show reader / Hide reader control, reader placement, Auto-apply, and Theme. Label filtering has its own row below the status message. Sender groups are ordered by count, then address. Click a group to expand it and expose individual messages. Filtering searches From, Subject, and snippet. When the filter contains text, an SVG X appears inside its right edge. Click it, or focus it with Tab and press Enter or Space, to clear the filter and return input focus. It disappears when empty; Ctrl+Z restores the cleared text.
 
-- Left-click a message row to display it when the reader is visible. If the reader is hidden, row clicks and Enter leave it hidden and preserve its previous message. Reading leaves checkmarks and Gmail unread status unchanged. Clicking a sender group expands or collapses it without replacing the reader.
+- Left-click an individual message row, or press Enter on it, to show the embedded reader and display that message, even when the reader was hidden. Reading leaves checkmarks and Gmail unread status unchanged. Activating a sender group expands or collapses it without opening a message or showing a hidden reader. Checkboxes and action controls do not trigger reading.
 - The SVG pop-out button beside the reader's subject opens the loaded message in a separate window. It stays on that message while you browse others; the inline reader remains available. Each click opens a new window. The button is disabled until a message has loaded. Tab reaches it, and Enter or Space activates it. Pop-out windows can be resized, scrolled, and closed independently without changing checkmarks, staging, or Gmail unread status.
 - Left-click a checkbox to select or clear that row's messages. Group checkboxes mark or clear their messages; a mixed group click marks all.
 - Middle-click an unchecked message row to select all undecided messages matching the current filter, including off-screen messages and collapsed groups. Middle-click a checked row to clear all selection, even if other rows are unchecked. A partially checked sender group counts as unchecked. This also works over a row's checkbox or action controls without activating those controls. Middle-click does not open messages, expand groups, change unread status, or stage mail. There are no Ctrl, right-click, or range selection gestures.
@@ -56,17 +60,17 @@ The top toolbar contains the message filter, Run query, Rules, Refresh, checked-
 - Read/unread actions write immediately, regardless of Auto-apply. They remove or add only UNREAD, keep messages in the Inbox, and leave checkmarks, staging, and the preview unchanged. The clicked row determines the operation for the entire target batch: an unread row marks them all read; a read row marks them all unread. A sender group counts as unread if any represented message is unread. The icon, dot, and bold text update only after confirmation. Failed or uncertain requests leave local labels unchanged; Refresh checks Gmail read status.
 - `...`, right-click, and Shift+F10 open the same context menu. Its Archive and Trash entries use the same selected-message scope and show the target count. Sender rule, Open message, expand/collapse, and the selection toggle still refer to the clicked row. Arrows navigate, Enter acts, and Escape or clicking outside closes the menu without changing the reader or checkmarks.
 - Sender rule opens a prefilled editor. Confirmation saves the rule and acts on current undecided messages matching its From pattern. Editing an existing rule from Rules only changes the rule; it does not stage messages.
-- Drag from a fully checked row to move the checked batch into a staging bin. Drag from an unchecked or partially checked row moves only that row's messages. The badge shows the message and sender counts. Checkbox and action controls never start mail drags.
-- Drop outside a bin or press Escape to cancel. Hidden staging stays hidden until you open it. With Auto-apply on, Archive and Trash drop hints warn that release writes immediately; space drops always create pending marks. Stale message IDs are discarded, and blocked or unknown writes disable drops.
-- Archive, Trash, and saved spaces stay separate in staging. Hover a sender for a peek; click to pin it. Put back and Empty all cancel unsubmitted marks.
-- Drag either pane's left divider to resize it. When the reader is below the list, drag its top divider to change its height. Reader width, reader height, and staging width are saved independently across launches. Smaller windows clamp the displayed widths without overwriting the preferred sizes. Rows always use two lines: sender and date above labels and subject. Resizing changes available text space, not row height.
-- The layout SVG at the bottom-right switches the reader between beside and below the list. Its icon and tooltip show the next position. Staging stays on the right at full height. Placement is saved across launches; switching keeps the current message and does not open a hidden reader. The page and sidebar icons beside it independently show or hide reader and staging, in that order. Visibility and widths are saved when changed and restored on the next launch. They stay reachable when panes are hidden, with a pending count beside them. Hiding the reader preserves its message and scroll within the session; a visible reader starts empty after restart. Hiding staging closes its sender peek but keeps pending decisions.
+- Drag from a fully checked row to move the checked batch onto a destination in the bottom staging line. Drag from an unchecked or partially checked row moves only that row's messages. The badge shows the message and sender counts. Checkbox and action controls never start mail drags.
+- Drop outside a destination or press Escape to cancel. Destination counts and drop targets remain available when review is collapsed; dropping does not open review. With Auto-apply on, Archive and Trash drop tooltips warn that release writes immediately; space drops always create pending marks. Stale message IDs are discarded, and blocked or unknown writes disable drops.
+- The roughly 48px bottom staging line always shows the pending count, Archive/Trash/saved-space counts, Review / Collapse, and Apply N. Destination counts scroll horizontally when needed. Review opens a shallow bottom tray, reducing the list and reader height instead of overlaying them or adding a third column. Compact sender rows show counts, destination, and outcome; review scrolls when it overflows. Click a sender for its message peek. Put back and Put back all cancel pending decisions, not Gmail writes; unknown outcomes cannot be put back.
+- Drag the reader's left divider to resize it. The optional below-list reader has a top divider to change its height. Reader width and height remain saved independently. Smaller windows clamp the displayed reader without overwriting its preferred size. The list regains the reader's width when hidden. Rows always use two lines: sender and date above labels and subject. Resizing changes available text space, not row height.
+- The top Show reader / Hide reader button stays in the same toolbar position in both states. The adjacent placement icon retains the optional beside/below choice and shows the next position. Hiding preserves the loaded message, scroll, and preferred reader size; a visible reader starts empty after restart. Review expansion is independent of reader visibility and is saved separately. Collapse closes the staging peek but keeps pending decisions, counts, Apply, and reconciliation available.
 - The email list has a right-edge scrollbar whenever its rows overflow, in either reader layout. Drag the thumb or click the track to page; wheel and keyboard scrolling keep it in sync. Its gutter keeps it clear of row actions. It disappears when all filtered rows fit.
-- With only Archive and Trash, drag their divider to adjust heights for the session. Adding spaces switches to a scrollable vertical stack; Apply remains pinned below it.
-- Apply submits staged decisions. Trash is not permanent deletion. Archive and Trash requests do not add or remove the UNREAD label.
+- Review uses a bounded, scrollable tray. Saved-space label/edit/remove controls and the inline space editor remain there; Apply stays in the separate bottom line, never inside the scrolling details.
+- Apply submits staged decisions, even with review collapsed. Failed and unknown counts remain visible in the bottom line. Unknown outcomes expose Recheck Gmail and disable Apply until reconciliation; failed decisions remain available for review and retry. Trash is not permanent deletion. Archive and Trash requests do not add or remove the UNREAD label.
 - Auto-apply defaults to off. Enabling it asks for confirmation; subsequent row actions submit immediately. Existing staged marks still require Apply. Run query always stages rules rather than submitting them.
-- Show a hidden reader with its toggle or Alt+R. The explicit Open message menu action can also show it; ordinary row clicks and Enter cannot. Rules hides the native reader until you return to Inbox. A staged or removed message keeps its preview with an explicit status.
-- Frost is the only built-in theme. Theme cycles through Frost and any custom palettes defined in settings. The Inbox, reader controls, and text fields share the active palette.
+- Show a hidden reader with its top toggle, Alt+R, individual message activation, or the explicit Open message action. Rules hides the native reader until you return to Inbox. A staged or removed message keeps its preview with an explicit status.
+- Frost is the only built-in theme. Theme cycles through Frost and any custom palettes defined in settings. The Inbox, reader controls, and form fields use the active palette. The top toolbar uses `header_background`; its filter and buttons keep dark surfaces, with lighter versions of the active accent and danger hues for readability.
 
 Tab reaches checkboxes, label details, and contextual actions. A row's controls remain visible while its menu is open. Menus stay inside the viewport and follow their target row rather than the pointer.
 
@@ -96,7 +100,7 @@ This X changes Gmail labels. The X on a filter chip still only clears a filter. 
 
 ### Spaces
 
-Click **+ New space** in the staging header. A blank bin appears there, with no modal. Enter a name, then press its label icon to open the inline fuzzy finder. Type part of a label name, use Up/Down to choose a result, and Enter or a click to toggle it. Matching is case-insensitive and accepts skipped characters, such as `prj` for Projects. Selected labels remain chips across searches; click a chip to remove it. Esc closes the finder without discarding the draft.
+Open Review, then click **+ New space** in its header. An inline draft appears in the scrollable tray, with no modal. Enter a name, then press its label icon to open the inline fuzzy finder. Type part of a label name, use Up/Down to choose a result, and Enter or a click to toggle it. Matching is case-insensitive and accepts skipped characters, such as `prj` for Projects. Selected labels remain chips across searches; click a chip to remove it. Esc closes the finder without discarding the draft.
 
 Save space requires a name and at least one available user label. Cancel discards the draft. Drag selected mail to the saved space, or use its Move selected button. These moves never auto-apply. Apply adds every configured label and removes only INBOX in one modify request per message. Existing labels and unread status remain unchanged. Confirmed messages leave staging; the space remains reusable.
 
@@ -111,18 +115,18 @@ The label icon edits an empty saved space. Each custom space has a Remove space 
 | Tab / Shift+Tab | Move between controls |
 | Up / Down, Home / End | Navigate the focused triage table |
 | Space / Enter on a checkbox | Toggle that checkbox only |
-| Enter | Load one message if reader is visible, or expand/collapse a sender |
+| Enter | Show/read an individual message, or expand/collapse a sender |
 | Right / Left | Expand/collapse sender |
 | Shift+F10 | Open the focused row's menu |
 | Up / Down, Enter, Escape in menu | Navigate, act, close |
 | Ctrl+F | Focus filter |
 | Ctrl+R | Connect or refresh |
 | Ctrl+L | Switch Inbox/Rules |
-| Ctrl+Shift+B | Hide/show the staging sidebar |
+| Ctrl+Shift+B | Expand/collapse staging review |
 | Alt+R | Hide/show the reader |
-| Left / Right on either width divider | Grow/shrink that pane by 16px and save its width |
+| Left / Right on the reader divider | Grow/shrink the reader by 16px and save its preferred width |
 | Up / Down on reader's top divider | Grow/shrink reader height by 16px and save it |
-| Up / Down on bin divider | Shrink/grow the Archive section by 16px |
+| Review / Collapse | Expand or collapse staging details without hiding Apply or counts |
 | Ctrl+Enter | Apply, outside text inputs |
 | Escape | End resizing, close rule editor or sender peek, or return from reader body to list |
 | Alt+I | Toggle remote images in the reader |
@@ -147,7 +151,7 @@ Rules use case-insensitive substring matching against From; the first match wins
 
 Configuration lives in `%USERPROFILE%\.mado\mado-mail`, equivalent to `~/.mado/mado-mail`:
 
-- `settings.json` contains preferences, custom themes, `paneWidths`, such as `{"reader":480,"staging":320}` in logical pixels, and `paneVisibility`, such as `{"reader":true,"staging":false}`. `readerPosition` is `beside` or `below`; `readerHeight` is the preferred bottom-reader height in logical pixels. Older configurations keep the previous defaults until you change them: reader hidden, staging shown, reader beside the list, bottom-reader height 360. Rules and temporary overlays do not change the saved visibility.
+- `settings.json` contains preferences and custom themes. `paneWidths.reader` stores the preferred reader width in logical pixels; `paneVisibility.reader` stores its visibility. `readerPosition` is `beside` by default or optionally `below`; `readerHeight` stores the preferred below-reader height. `stagingReviewOpen` independently stores whether review is expanded and defaults to false, including in older configurations. The bottom staging line is always present. Legacy `paneWidths.staging` and `paneVisibility.staging` remain readable and preserved but no longer create a sidebar. Rules and temporary overlays do not change saved reader/review visibility.
 - `settings.json` also stores `spaces`, each with a numeric `id`, a `name`, and `label_ids`. Older settings default to no spaces. Exports include spaces.
 - `rules.json` contains an ordered JSON array of sender rules. Each rule has `id`, `from`, and `action`; actions are `archive` or `trash`.
 - `client_secret.json`, `gpui.lock`, and `gpui-submission.json` also live here. Electron uses `token.json`; GPUI tokens remain in Windows Credential Manager.
@@ -156,11 +160,17 @@ First launch creates missing files. Existing combined settings are migrated with
 
 When consolidating old folders, close both apps first. Keep the current `settings.json` and `rules.json`; move active credentials and the recovery journal from `mado_mail`. Preserve conflicting legacy files under `mado-mail/legacy-backup` rather than overwriting current settings. Never discard a pending submission journal. `_mado_mail` is not an application data path.
 
-Writes use temporary files and atomic replacement for each file. Importing both files is not a single transaction; a partial-save error blocks further changes until restart reloads the saved state. Invalid configuration is reported rather than overwritten. Only one real GPUI application instance can use the config at a time. Close the app before editing these files. Demo instances are isolated and do not load or save personal rules.
+Writes use temporary files and atomic replacement for each file. Importing both files is not a single transaction; a partial-save error blocks further changes until restart reloads the saved state. Invalid configuration is reported rather than overwritten. Only one real GPUI application instance can use the config at a time. Active-theme colors in `settings.json` can be edited while the Inbox is open. Close the app before editing other settings or rules. Demo instances are isolated and do not load, save, or watch personal settings.
 
 ### Custom themes
 
-Close the app before editing settings, then restart. All nine default Frost colors are written under `themes.frost`, and you can edit them directly. Other named palettes may omit colors; omitted values inherit the compiled Frost defaults. Set `theme` to a palette name or choose it with the Theme button after restarting. Keep your existing preferences and `autoApply` value; sender rules belong in `rules.json`.
+Color edits in the active theme reload about one second after saving `settings.json`, without restarting. All default Frost colors are written under `themes.frost`, and you can edit them directly. Other named palettes may omit colors; omitted values inherit the compiled Frost defaults. Set `theme` to a palette name or choose it with the Theme button after restarting. Keep your existing preferences and `autoApply` value; sender rules belong in `rules.json`.
+
+Reloading applies only the selected theme's color values. It does not switch themes, enable Auto-apply, import rules, change spaces or pane layout, or act on mail. The Inbox, text fields, and open reader controls refresh together; email HTML keeps its sender's styling. Later in-app saves retain successfully reloaded colors.
+
+Missing files or themes, incomplete JSON, and invalid colors keep the last valid palette. A separate message below the mail status explains the problem; saving a valid file clears it. Reloading never rewrites the file. Non-color edits still require closing the app and restarting, and startup configuration errors retain their existing restart/recovery requirements.
+
+Set `header_background` in the active theme to change the top toolbar background. It defaults to `#1b2230` and is added to older Frost settings on the next launch. Filter, button, and text colors stay unchanged, so choose a dark background.
 
 Example theme fields to add to the existing JSON:
 
@@ -170,13 +180,14 @@ Example theme fields to add to the existing JSON:
   "themes": {
     "ocean": {
       "accent": "#087f5b",
-      "panel": "#e6f7ef"
+      "panel": "#e6f7ef",
+      "header_background": "#233044"
     }
   }
 }
 ```
 
-The full settings file also contains `version` and `autoApply`. Available palette colors are `canvas`, `panel`, `panel2`, `line`, `ink`, `ink_dim`, `accent`, `danger`, and `on_accent`. Colors use hexadecimal strings such as `#087f5b`. The `frost` entry is editable and appears only once in the theme chooser. Switching themes updates readers that are already open; email HTML keeps its sender's styling. Native titlebars follow Windows appearance settings.
+The full settings file also contains `version` and `autoApply`. Available palette colors are `canvas`, `panel`, `panel2`, `line`, `ink`, `ink_dim`, `accent`, `danger`, `on_accent`, and `header_background`. Colors use hexadecimal strings such as `#087f5b`. The `frost` entry is editable and appears only once in the theme chooser. Switching themes updates readers that are already open; email HTML keeps its sender's styling. Native titlebars follow Windows appearance settings.
 
 Selection boxes show empty, checked, and mixed states. Their marks and the expand/collapse chevrons use custom SVGs embedded from `assets/icons/`; installed builds do not need those source files alongside the executable.
 
@@ -200,7 +211,7 @@ Supported embedded formats are PNG/JPEG/GIF/WebP/BMP. Inline SVG, CID CSS backgr
 
 Native child visibility follows pane visibility, Rules, resizing, and overlapping overlays. List-local menus leave the body visible in the beside layout. In the below layout, row menus and label details temporarily hide the native body so it cannot cover them. Mail dragging temporarily hides the native child so it cannot intercept the pointer while crossing to staging. The same reader and scroll position return after drop or cancellation. Closing a pane returns focus to the list; Tab can leave the browser body. WebView creation runs outside GPUI state borrows because Wry pumps Windows messages while starting.
 
-Startup preserves `GPUI_DISABLE_DIRECT_COMPOSITION=1` before platform initialization. GPUI 0.2.2's default composition layer otherwise covers the WebView2 child. This uses the supported DirectX HWND rendering path, not software rendering.
+The application pins `gpui-pre` and `gpui-pre-platform` to `0.3.11`, aliased as `gpui` and `gpui_platform`. Startup uses `gpui_platform::application()` and sets `GPUI_DISABLE_DIRECT_COMPOSITION=1` before platform initialization. The default composition layer otherwise covers the WebView2 child. This uses the supported DirectX HWND rendering path, not software rendering. See [ADR 0002](adr/0002-gpui-pre.md) for package provenance and update requirements.
 
 ## Verification limits
 

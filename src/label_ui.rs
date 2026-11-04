@@ -37,14 +37,14 @@ impl MailApp {
             let name = self.labels.entries[&label].name.clone();
             self.label_removal = Some(LabelRemoval { label, name, ids, anchor });
             if let Some(reader) = &self.reader { reader.read(cx).focus_host(); }
-            self.label_removal_focus[0].focus(window);
+            self.label_removal_focus[0].focus(window, cx);
         }
         cx.notify();
     }
     pub(super) fn confirm_label_removal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_stage() { return; }
         let Some(removal) = self.label_removal.take() else { return; };
-        self.table_focus.focus(window);
+        self.table_focus.focus(window, cx);
         if self.triage.label_removal_ids(&removal.ids, &removal.label) != removal.ids {
             self.error("Messages changed. Reopen the label removal to review its targets.", cx); return;
         }
@@ -57,14 +57,14 @@ impl MailApp {
         if self.label_picker == Some(mode) && self.label_row_targets.as_ref().map(|(key, _)| key) == targets.as_ref().map(|(key, _)| key) {
             self.label_picker = None;
             self.label_row_targets = None;
-            self.table_focus.focus(window);
+            self.table_focus.focus(window, cx);
         } else {
             self.label_picker = Some(mode);
             self.label_row_targets = targets;
             self.label_picker_cursor = 0;
             self.label_query.update(cx, |input, cx| input.set("", cx));
             if let Some(reader) = &self.reader { reader.read(cx).focus_host(); }
-            self.label_query.read(cx).focus_handle.focus(window);
+            self.label_query.read(cx).focus_handle.clone().focus(window, cx);
             self.row_menu = None; self.peek = None; self.hovered = None;
         }
         cx.notify();
@@ -232,7 +232,7 @@ impl MailApp {
                         "escape" => this.command(Command::CancelLabelRemoval, window, cx),
                         "tab" => {
                             let next = if this.label_removal_focus[0].is_focused(window) { 1 } else { 0 };
-                            this.label_removal_focus[next].focus(window);
+                            this.label_removal_focus[next].focus(window, cx);
                         }
                         _ => return,
                     }

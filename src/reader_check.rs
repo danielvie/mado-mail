@@ -138,10 +138,10 @@ pub fn start(webview: Rc<WebView>, window: &Window, cx: &mut Context<Reader>) {
             capture_parent(cx, "ffffff").await?;
             // A palette change must update an already open reader without changing the email document.
             let custom: Palette = serde_json::from_str(r##"{"panel":"#e6f7ef","accent":"#087f5b"}"##)?;
-            cx.update(|cx| custom.apply(cx))?;
+            cx.update(|cx| custom.apply(cx));
             cx.background_executor().timer(Duration::from_millis(250)).await;
             capture_parent(cx, "e6f7ef").await?;
-            cx.update(|cx| Palette::default().apply(cx))?;
+            cx.update(|cx| Palette::default().apply(cx));
             cx.background_executor().timer(Duration::from_millis(250)).await;
             capture_parent(cx, "ffffff").await?;
             this.update(cx, |this, cx| this.toggle_images(cx))?;

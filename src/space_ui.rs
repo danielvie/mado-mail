@@ -37,12 +37,14 @@ impl MailApp {
         let name = space.map_or("", |space| space.name.as_str()).to_owned();
         let labels = space.map(|space| space.label_ids.iter().cloned().collect()).unwrap_or_default();
         self.space_draft = Some(SpaceDraft { id, labels, picker: id.is_some(), cursor: 0 });
+        self.sidebar_visible = true;
+        self.save_pane_layout(cx);
         self.staging_scroll.set_offset(gpui::point(px(0.), px(0.)));
         self.space_name.update(cx, |input, cx| input.set(&name, cx));
         self.space_query.update(cx, |input, cx| input.set("", cx));
         self.row_menu = None; self.peek = None; self.hovered = None;
-        if id.is_some() { self.space_query.read(cx).focus_handle.focus(window); }
-        else { self.space_name.read(cx).focus_handle.focus(window); }
+        if id.is_some() { self.space_query.read(cx).focus_handle.clone().focus(window, cx); }
+        else { self.space_name.read(cx).focus_handle.clone().focus(window, cx); }
         cx.notify();
     }
     pub(super) fn can_remove_space(&self, id: u64) -> bool {
@@ -58,7 +60,7 @@ impl MailApp {
             self.peek = None; self.hovered = None;
             self.failed = false;
             self.status = "Space removed locally. Gmail labels and messages are unchanged.".into();
-            self.table_focus.focus(window);
+            self.table_focus.focus(window, cx);
         }
     }
     pub(super) fn save_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -85,7 +87,7 @@ impl MailApp {
             self.staging_scroll.scroll_to_bottom();
             self.failed = false;
             self.status = "Space saved locally. Drop messages or use Move selected, then Apply.".into();
-            self.table_focus.focus(window);
+            self.table_focus.focus(window, cx);
         }
     }
     pub(super) fn toggle_space_label(&mut self, id: String, cx: &mut Context<Self>) {
@@ -108,7 +110,7 @@ impl MailApp {
                 let id = results.get(draft.cursor).map(|label| label.id.clone());
                 if let Some(id) = id { self.toggle_space_label(id, cx); }
             }
-            "escape" => { draft.picker = false; self.space_name.read(cx).focus_handle.focus(window); }
+            "escape" => { draft.picker = false; self.space_name.read(cx).focus_handle.clone().focus(window, cx); }
             _ => return,
         }
         window.prevent_default(); cx.stop_propagation(); cx.notify();

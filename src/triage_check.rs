@@ -4,9 +4,9 @@ use anyhow::{Result, ensure};
 use gpui::{AnyWindowHandle, Context, EntityInputHandler, Keystroke, Pixels, Point, point, px};
 use serde_json::json;
 use std::time::Duration;
-use wry::{WebView, WebViewExtWindows};
+use wry::{WebView, WebViewExtWindows, raw_window_handle::{HasWindowHandle, RawWindowHandle}};
 use windows::Win32::{
-    Foundation::{LPARAM, WPARAM},
+    Foundation::{HWND, LPARAM, WPARAM},
     UI::{
         Input::KeyboardAndMouse::{GetActiveWindow, GetFocus},
         WindowsAndMessaging::{
@@ -16,11 +16,21 @@ use windows::Win32::{
     },
 };
 
+fn input_hwnd(window: &gpui::Window, refusal: &str) -> Result<HWND> {
+    ensure!(std::env::args().any(|arg| arg == "--triage-check"), "Refusing input outside synthetic triage-check mode");
+    let RawWindowHandle::Win32(handle) = HasWindowHandle::window_handle(window)?.as_raw() else {
+        anyhow::bail!("Synthetic check window is not Win32");
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
+    ensure!(pid == std::process::id(), "{refusal}");
+    Ok(hwnd)
+}
+
 fn mouse(window: &gpui::Window, message: u32, button: usize, position: Point<Pixels>) -> Result<()> {
+    let hwnd = input_hwnd(window, "Refusing input outside the synthetic check window")?;
     unsafe {
-        let hwnd = GetActiveWindow(); let mut pid = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        ensure!(pid == std::process::id(), "Refusing input outside the synthetic check window");
         let x = (f32::from(position.x) * window.scale_factor()).round() as i16 as u16;
         let y = (f32::from(position.y) * window.scale_factor()).round() as i16 as u16;
         PostMessageW(Some(hwnd), message, WPARAM(button), LPARAM((u32::from(x) | (u32::from(y) << 16)) as isize))?;
@@ -34,15 +44,9 @@ fn drag(
     to: Point<Pixels>,
     release: Point<Pixels>,
 ) -> Result<()> {
-    // Post only to this synthetic process's active window. Never move the desktop pointer or send global input.
+    // Post only to the supplied synthetic window. Never move the desktop pointer or send global input.
+    let hwnd = input_hwnd(window, "Refusing mouse input outside the synthetic check window")?;
     unsafe {
-        let hwnd = GetActiveWindow();
-        let mut pid = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        ensure!(
-            pid == std::process::id(),
-            "Refusing mouse input outside the synthetic check window"
-        );
         for (message, button, position) in [
             (WM_MOUSEMOVE, 0, from),
             (WM_LBUTTONDOWN, 1, from),
@@ -77,6 +81,39 @@ fn check_two_line_rows(this: &MailApp) -> Result<()> {
     ensure!((spacing - 68.).abs() < 1., "Rows switched away from the two-line layout: spacing {spacing}");
     Ok(())
 }
+fn staging_drop_position(app: &MailApp, action: Action) -> Result<Point<Pixels>> {
+    let (_, bounds) = app.staging_targets.iter().find(|(target, _)| *target == action)
+        .ok_or_else(|| anyhow::anyhow!("Staging destination {action:?} is not measured"))?;
+    let center = bounds.center();
+    ensure!(bounds.size.width > px(0.) && bounds.size.height > px(0.)
+        && app.staging_line_bounds.contains(&center), "Staging destination {action:?} is outside the bottom line: {bounds:?}");
+    Ok(center)
+}
+
+fn check_staging_geometry(app: &MailApp, window: &gpui::Window) -> Result<()> {
+    let line = app.staging_line_bounds;
+    let workspace = app.workspace_bounds;
+    ensure!((f32::from(line.size.height) - 48.).abs() < 1.
+        && line.left() == px(0.) && line.right() == window.viewport_size().width
+        && line.bottom() == window.viewport_size().height, "Staging line is not 48px across the window: {line:?}");
+    ensure!(workspace.left() == line.left() && workspace.right() == line.right()
+        && (f32::from(workspace.bottom() - line.top())).abs() < 1.
+        && app.widths(window).1 == 0., "Workspace still reserves a right staging column: {workspace:?}");
+    if app.sidebar_visible {
+        let tray = app.bin_bounds;
+        ensure!(tray.left() == workspace.left() && tray.right() == workspace.right()
+            && (f32::from(tray.bottom() - workspace.bottom())).abs() < 1.
+            && tray.size.height > px(0.) && tray.size.height <= px(200.)
+            && f32::from(tray.size.height) <= f32::from(workspace.size.height) * 0.4 + 1.
+            && app.table_bounds.bottom() <= tray.top(), "Review is not a shallow bottom tray: {tray:?}");
+    } else if !app.reader_visible || !app.reader_below() {
+        ensure!((f32::from(app.table_bounds.bottom() - workspace.bottom())).abs() < 1., "Collapsed review still consumes list height");
+    }
+    staging_drop_position(app, Action::Archive)?;
+    staging_drop_position(app, Action::Trash)?;
+    Ok(())
+}
+
 fn visible(webview: &WebView) -> Result<bool> {
     unsafe {
         let mut visible = false.into();
@@ -179,7 +216,7 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
             if action == "read-archive-read" { app.triage.set_read(&expected, true); }
             app.command(Command::Open("demo-24".into()), window, cx);
             app.cursor = 4; app.hovered_row = Some("m:demo-24".into());
-            window.activate_window(); app.table_focus.focus(window); cx.notify();
+            window.activate_window(); app.table_focus.focus(window, cx); cx.notify();
             (app.triage.emails.iter().map(|e| (e.id.clone(), e.label_ids.clone())).collect::<Vec<_>>(), app.triage.selection.clone(), app.triage.work())
         }))?;
         // WebView2 creation pumps native messages; do not click while the initial reader is mounting.
@@ -200,13 +237,17 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
                 window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
             })?;
         } else {
-            window.update(cx, |root, window, cx| {
+            let pos = window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
                 let bounds = app.row_bounds["m:demo-24"];
                 let pos = point(bounds.right() - px(if reading { 144. } else if read_archive { 114. } else if action == "archive" { 84. } else { 52. }), bounds.top() + px(18.));
                 window.activate_window();
-                drag(window, pos, pos, pos)
+                mouse(window, WM_MOUSEMOVE, 0, pos)?;
+                anyhow::Ok(pos)
             })??;
+            // Hover changes contextual hitboxes; render them before posting the press and release.
+            cx.background_executor().timer(Duration::from_millis(150)).await;
+            window.update(cx, |_, window, _| drag(window, pos, pos, pos))??;
         }
         for _ in 0..20 {
             cx.background_executor().timer(Duration::from_millis(100)).await;
@@ -230,7 +271,7 @@ async fn check_selected_actions(window: AnyWindowHandle, this: &gpui::WeakEntity
                         expected_labels.retain(|label| label != "UNREAD");
                         if action == "unread" { expected_labels.push("UNREAD".into()); }
                     }
-                    ensure!(email.label_ids == expected_labels, "{action}, checked={checked}: wrong read state for {id}");
+                    ensure!(email.label_ids == expected_labels, "{action}, checked={checked}: wrong read state for {id}; status={}; labels={:?}; expected={expected_labels:?}", app.status, email.label_ids);
                 }
             }
             if reading || auto { ensure!(app.triage.work() == before.2, "{action} changed existing staging"); }
@@ -287,28 +328,64 @@ mod space_check;
 #[path = "label_check.rs"]
 mod label_check;
 
+async fn check_collapsed_outcomes(window: AnyWindowHandle, this: &gpui::WeakEntity<MailApp>, cx: &mut gpui::AsyncApp) -> Result<()> {
+    let saved = window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+        ensure!(!app.sidebar_visible && !app.busy && !app.blocked && app.demo && app.session.is_none(), "Recovery check requires idle synthetic collapsed staging");
+        let saved = (app.triage.marks.clone(), app.triage.selection.clone(),
+            app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>(), app.failed, app.status.clone());
+        let ids: Vec<_> = app.triage.marks.keys().take(2).cloned().collect();
+        ensure!(ids.len() == 2, "Recovery check needs two existing pending decisions");
+        app.command(Command::ToggleSidebar, window, cx);
+        app.triage.marks.get_mut(&ids[0]).unwrap().outcome = Some(crate::Outcome::Failed("Synthetic rejection".into()));
+        app.triage.marks.get_mut(&ids[1]).unwrap().outcome = Some(crate::Outcome::Unknown("Synthetic interrupted submission".into()));
+        app.command(Command::ToggleSidebar, window, cx);
+        Ok((saved, ids))
+    }))??;
+    cx.background_executor().timer(Duration::from_millis(200)).await;
+    window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+        check_staging_geometry(app, window)?;
+        ensure!(!app.sidebar_visible && !app.settings.staging_review_open
+            && app.staging_counts() == (saved.0.0.len(), 1, 1) && !app.staging_can_apply(), "Collapsed line hid failed/unknown counts or enabled unknown retry");
+        let pending = app.triage.work();
+        let unknown = app.triage.marks[&saved.1[1]].outcome.clone();
+        app.command(Command::PutBack(vec![saved.1[1].clone()]), window, cx);
+        app.command(Command::Apply, window, cx);
+        ensure!(app.triage.work() == pending && app.triage.marks[&saved.1[1]].outcome == unknown
+            && app.triage.selection == saved.0.1
+            && app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>() == saved.0.2,
+            "Collapsed unknown outcome was cancelled, retried, or changed mail");
+        app.triage.marks.get_mut(&saved.1[1]).unwrap().outcome = None;
+        ensure!(app.staging_counts() == (saved.0.0.len(), 1, 0) && app.staging_can_apply(), "Failed-only collapsed staging cannot retry Apply");
+        app.busy = true;
+        ensure!(!app.staging_can_apply(), "Failed retry ignored an in-flight write");
+        app.busy = false; app.blocked = true;
+        ensure!(!app.staging_can_apply(), "Failed retry ignored blocked recovery");
+        app.blocked = false;
+        app.triage.marks = saved.0.0.clone(); app.failed = saved.0.3; app.status = saved.0.4.clone();
+        cx.notify(); Ok(())
+    }))??;
+    cx.background_executor().timer(Duration::from_millis(200)).await;
+    this.update(cx, |app, _| {
+        ensure!(app.staging_counts() == (saved.0.0.len(), 0, 0) && app.staging_can_apply(), "Recovery check did not restore original pending decisions"); Ok(())
+    })??;
+    Ok(())
+}
+
 async fn check_reader_visibility(window: AnyWindowHandle, this: &gpui::WeakEntity<MailApp>, cx: &mut gpui::AsyncApp) -> Result<()> {
-    let baseline = this.update(cx, |app, _| (app.settings.clone(), app.triage.work(), app.triage.emails.iter().map(|email| email.label_ids.clone()).collect::<Vec<_>>()))?;
+    check_collapsed_outcomes(window, this, cx).await?;
+    let baseline = window.update(cx, |root, window, cx| {
+        let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
+        ensure!(!app.reader_visible && !app.sidebar_visible && !app.settings.staging_review_open, "Synthetic reader/review defaults are not collapsed");
+        check_staging_geometry(app, window)?;
+        // The measurement canvas excludes the button's two physical-pixel borders.
+        ensure!((f32::from(app.reader_toggle_bounds.size.width) + 2. / window.scale_factor() - 112.).abs() < 1.
+            && app.reader_position_bounds.left() >= app.reader_toggle_bounds.right(), "Reader controls are not adjacent in the top toolbar: toggle {:?}, placement {:?}", app.reader_toggle_bounds, app.reader_position_bounds);
+        Ok((app.settings.clone(), app.triage.work(), app.triage.emails.iter().map(|email| email.label_ids.clone()).collect::<Vec<_>>(), app.reader_toggle_bounds))
+    })??;
     window.update(cx, |root, window, cx| {
         window.activate_window();
         click_row(root.downcast::<MailApp>().unwrap().read(cx), window, 4, false)
     })??;
-    cx.background_executor().timer(Duration::from_millis(250)).await;
-    this.update(cx, |app, _| {
-        ensure!(!app.reader_visible && app.reader.is_none() && app.active_message.is_none() && app.settings == baseline.0, "Clicking a message opened the hidden reader or changed its preference"); Ok(())
-    })??;
-    window.update(cx, |root, window, cx| {
-        root.downcast::<MailApp>().unwrap().update(cx, |app, _| { app.cursor = 5; app.table_focus.focus(window); });
-        window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
-    })?;
-    window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
-        ensure!(!app.reader_visible && app.reader.is_none(), "Enter opened the hidden reader");
-        app.command(Command::ToggleReader, window, cx);
-        let row = app.triage.rows("").into_iter().find(|row| row.key == "m:demo-24").unwrap();
-        app.activate_row(&row, window, cx);
-        ensure!(app.reader_visible && app.active_message.as_deref() == Some("demo-24"), "Visible reader did not load the activated message");
-        Ok(())
-    }))??;
     let mut browser = None;
     for _ in 0..50 {
         cx.background_executor().timer(Duration::from_millis(100)).await;
@@ -316,21 +393,77 @@ async fn check_reader_visibility(window: AnyWindowHandle, this: &gpui::WeakEntit
         if let Some(ref browser) = browser { if visible(browser)? { break; } }
     }
     let browser = browser.ok_or_else(|| anyhow::anyhow!("Synthetic reader did not load"))?;
-    ensure!(visible(&browser)?, "Reader did not become visible after explicit toggle");
+    ensure!(visible(&browser)?, "Individual activation did not reveal the native reader");
+    this.update(cx, |app, _| {
+        ensure!(app.reader_visible && app.settings.pane_visibility.reader && app.active_message.as_deref() == Some("demo-24")
+            && app.reader_toggle_bounds == baseline.3 && app.reader_width == baseline.0.pane_widths.reader as f32,
+            "Individual activation did not reveal the message or moved the reader button/width"); Ok(())
+    })??;
+    browser.evaluate_script("window.scrollTo(0,80)")?;
+    let scrolled = crate::reader_check::probe(&browser).await?;
+    ensure!(scrolled["scroll"].as_f64().unwrap_or_default() > 0., "Synthetic reader did not scroll before hiding");
+    // The measured top button hides without discarding the current message or scroll.
+    window.update(cx, |root, window, cx| {
+        let pos = root.downcast::<MailApp>().unwrap().read(cx).reader_toggle_bounds.center();
+        drag(window, pos, pos, pos)
+    })??;
+    cx.background_executor().timer(Duration::from_millis(250)).await;
+    ensure!(!visible(&browser)?, "Native reader stayed visible after hiding");
     window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
-        app.command(Command::ToggleReader, window, cx);
-        let row = app.triage.rows("").into_iter().find(|row| row.key == "m:demo-25").unwrap();
+        ensure!(!app.reader_visible && !app.settings.pane_visibility.reader && app.active_message.as_deref() == Some("demo-24")
+            && app.reader_toggle_bounds == baseline.3, "Hiding discarded the preview or moved the top button");
+        for _ in 0..2 {
+            let row = app.triage.rows("").into_iter().find(|row| row.key == "b:studio.updates@example.test").unwrap();
+            let expanded = app.triage.expanded.contains("studio.updates@example.test");
+            app.activate_row(&row, window, cx);
+            ensure!(app.triage.expanded.contains("studio.updates@example.test") != expanded
+                && !app.reader_visible && app.active_message.as_deref() == Some("demo-24"), "Sender group read mail instead of toggling expansion");
+        }
+        Ok(())
+    }))??;
+    cx.background_executor().timer(Duration::from_millis(200)).await;
+    for selected in [true, false] {
+        window.update(cx, |root, window, cx| click_row(root.downcast::<MailApp>().unwrap().read(cx), window, 4, true))??;
+        cx.background_executor().timer(Duration::from_millis(150)).await;
+        this.update(cx, |app, _| {
+            ensure!(app.triage.selection.contains("demo-24") == selected && !app.reader_visible
+                && app.active_message.as_deref() == Some("demo-24"), "Checkbox changed the hidden preview or failed to toggle"); Ok(())
+        })??;
+    }
+    // Reopen the same message through the fixed top button before replacing it with Enter.
+    window.update(cx, |root, window, cx| {
+        let pos = root.downcast::<MailApp>().unwrap().read(cx).reader_toggle_bounds.center();
+        drag(window, pos, pos, pos)
+    })??;
+    cx.background_executor().timer(Duration::from_millis(250)).await;
+    let reopened = crate::reader_check::probe(&browser).await?;
+    ensure!(visible(&browser)? && reopened["scroll"] == scrolled["scroll"], "Hide/show lost native visibility or reader scroll");
+    window.update(cx, |root, window, cx| {
+        root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+            app.command(Command::ToggleReader, window, cx);
+            app.cursor = 5; app.table_focus.focus(window, cx);
+        });
+        window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+    })?;
+    cx.background_executor().timer(Duration::from_millis(250)).await;
+    window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+        ensure!(app.reader_visible && app.active_message.as_deref() == Some("demo-25"), "Enter did not reveal an individual message from the hidden reader");
+        let row = app.triage.rows("").into_iter().find(|row| row.key == "m:demo-24").unwrap();
         app.activate_row(&row, window, cx);
-        ensure!(!app.reader_visible && !app.settings.pane_visibility.reader && app.active_message.as_deref() == Some("demo-24"), "Row activation reopened or replaced a hidden preview");
-        ensure!(app.triage.work() == baseline.1 && app.triage.emails.iter().map(|email| email.label_ids.clone()).collect::<Vec<_>>() == baseline.2 && app.triage.selection.is_empty(), "Row activation changed mail or checkmarks");
+        ensure!(app.reader_visible && app.active_message.as_deref() == Some("demo-24"), "Visible reader did not load the activated message");
+        app.command(Command::ToggleReader, window, cx);
         Ok(())
     }))??;
     cx.background_executor().timer(Duration::from_millis(250)).await;
-    ensure!(!visible(&browser)?, "Native reader stayed visible after hiding");
+    ensure!(!visible(&browser)?, "Reader stayed visible before explicit Open");
     window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
         app.open_row_menu("m:demo-25", window, cx);
         app.menu_action(3, window, cx);
         ensure!(app.reader_visible && app.active_message.as_deref() == Some("demo-25"), "Explicit Open message stopped working");
+        ensure!(!app.sidebar_visible && app.settings.staging_review_open == baseline.0.staging_review_open
+            && app.settings.pane_visibility.staging == baseline.0.pane_visibility.staging, "Reader activation changed review or legacy staging visibility");
+        ensure!(app.triage.work() == baseline.1 && app.triage.emails.iter().map(|email| email.label_ids.clone()).collect::<Vec<_>>() == baseline.2
+            && app.triage.selection.is_empty() && app.demo && app.session.is_none(), "Reader interactions changed mail, unread status, checkmarks, or reached Gmail");
         Ok(())
     }))??;
     Ok(())
@@ -358,62 +491,76 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             let original_size = window.update(cx, |_, window, _| window.viewport_size())?;
             if !scrollbar_only {
             this.update(cx, |this, _| check_two_line_rows(this))??;
-            let from = window.update(cx, |root, window, cx| {
-                let this = root.downcast::<MailApp>().unwrap();
-                let this = this.read(cx);
-                ensure!(this.bin_bounds.size.height > px(200.), "Staging bins have no measured layout");
-                Ok(point(window.viewport_size().width - px(this.pane_width(window) + crate::DIVIDER / 2.), this.bin_bounds.top() + px(40.)))
+            check_collapsed_outcomes(window, &this, cx).await?;
+            let saved = window.update(cx, |root, window, cx| {
+                let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
+                ensure!(!app.sidebar_visible && !app.settings.staging_review_open, "Review must default to collapsed");
+                check_staging_geometry(app, window)?;
+                Ok((app.triage.work(), app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>(),
+                    app.table_bounds.size.height, app.settings.pane_visibility.clone(), app.settings.pane_widths.clone()))
             })??;
-            window.update(cx, |_, window, _| {
-                let to = point(from.x - px(80.), from.y);
-                drag(window, from, to, point(px(-10.), px(-10.)))
-            })??;
-            cx.background_executor().timer(Duration::from_millis(150)).await;
-            this.update(cx, |this, _| {
-                ensure!((this.sidebar_width - 400.).abs() < 1. && this.resize_drag.is_none(), "Sidebar width drag or outside release failed");
-                ensure!(this.triage.selection.is_empty(), "Resize changed mail selection"); Ok(())
-            })??;
-            window.update(cx, |_, window, cx| { window.dispatch_keystroke(Keystroke::parse("right").unwrap(), cx); })?;
-            this.update(cx, |this, _| { ensure!((this.sidebar_width - 384.).abs() < 1., "Sidebar keyboard resize failed"); Ok(()) })??;
-            cx.background_executor().timer(Duration::from_millis(150)).await;
-            let from = this.update(cx, |this, _| point(this.bin_bounds.left() + px(100.), this.bin_bounds.top() + px(this.bin_height() * 0.5 + crate::DIVIDER / 2.)))?;
-            window.update(cx, |_, window, _| {
-                let to = point(from.x, from.y + px(60.));
-                drag(window, from, to, to)
-            })??;
-            cx.background_executor().timer(Duration::from_millis(150)).await;
-            let fraction = this.update(cx, |this, _| {
-                ensure!(this.archive_fraction > 0.5 && this.resize_drag.is_none(), "Archive/Delete divider drag failed"); Ok(this.archive_fraction)
-            })??;
-            window.update(cx, |_, window, cx| { window.dispatch_keystroke(Keystroke::parse("up").unwrap(), cx); })?;
-            this.update(cx, |this, _| { ensure!(this.archive_fraction < fraction, "Bin keyboard resize failed"); Ok(()) })??;
-            let saved = this.update(cx, |this, _| {
-                this.peek = Some(("digest@example.test".into(), Action::Archive));
-                (this.sidebar_width, this.archive_fraction, this.triage.work())
+            // Apply is the last bottom-line tab stop; Review immediately precedes it.
+            window.update(cx, |_, window, cx| {
+                window.blur(cx);
+                for _ in 0..2 { window.focus_prev(cx); }
+                window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
             })?;
-            window.update(cx, |_, window, cx| { window.dispatch_keystroke(Keystroke::parse("ctrl-shift-b").unwrap(), cx); })?;
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+                ensure!(app.sidebar_visible && app.settings.staging_review_open && !app.reader_visible, "Review button did not expand independently");
+                check_staging_geometry(app, window)?;
+                ensure!((f32::from(saved.2 - app.table_bounds.size.height - app.bin_bounds.size.height)).abs() < 1., "Review did not reduce the list by the tray height");
+                app.peek = Some(("digest@example.test".into(), Action::Archive));
+                app.command(Command::ToggleSidebar, window, cx);
+                Ok(())
+            }))??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
-            this.update(cx, |this, _| { ensure!(!this.sidebar_visible && !this.settings.pane_visibility.staging && this.peek.is_none() && this.hovered.is_none(), "Collapse did not save visibility or left the sender peek visible"); Ok(()) })??;
-            window.update(cx, |_, window, cx| { window.dispatch_keystroke(Keystroke::parse("ctrl-shift-b").unwrap(), cx); })?;
-            this.update(cx, |this, _| {
-                ensure!(this.sidebar_visible && this.settings.pane_visibility.staging && this.sidebar_width == saved.0 && this.archive_fraction == saved.1 && this.triage.work() == saved.2, "Reopening changed pane dimensions or pending decisions"); Ok(())
+            window.update(cx, |root, window, cx| {
+                let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
+                check_staging_geometry(app, window)?;
+                ensure!(!app.sidebar_visible && !app.settings.staging_review_open && app.peek.is_none() && app.hovered.is_none()
+                    && app.table_bounds.size.height == saved.2, "Collapse left a peek or failed to recover list height");
+                ensure!(app.triage.work() == saved.0 && app.triage.selection.is_empty()
+                    && app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>() == saved.1
+                    && app.settings.pane_visibility == saved.3 && app.settings.pane_widths == saved.4,
+                    "Review changed pending decisions, mail, reader visibility, or legacy pane settings");
+                // Exercise the actual Apply button with details collapsed, not only the command.
+                window.blur(cx); window.focus_prev(cx);
+                window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+                Ok(())
             })??;
-            window.update(cx, |_, window, _| window.resize(gpui::size(px(1100.), px(600.))))?;
+            this.update(cx, |app, cx| {
+                let staged: Vec<_> = saved.0.iter().map(|work| work.id.clone()).collect();
+                let remaining: Vec<_> = saved.1.iter().filter(|(id, _)| !staged.contains(id)).cloned().collect();
+                ensure!(app.triage.marks.is_empty()
+                    && app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>() == remaining
+                    && !app.sidebar_visible && !app.reader_visible && app.demo && app.session.is_none(),
+                    "Collapsed Apply was unreachable, changed unstaged mail, or opened a pane");
+                app.triage = triage::demo(); cx.notify(); Ok(())
+            })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
+            window.update(cx, |_, window, cx| {
+                window.dispatch_keystroke(Keystroke::parse("ctrl-shift-b").unwrap(), cx);
+                window.resize(gpui::size(px(1100.), px(600.)));
+            })?;
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            window.update(cx, |root, window, cx| {
+                let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
+                ensure!(app.sidebar_visible && app.settings.staging_review_open, "Review shortcut did not reopen the tray");
+                check_staging_geometry(app, window)?;
+                check_two_line_rows(app)
+            })??;
+            window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| {
+                app.command(Command::ToggleSidebar, window, cx);
+                window.resize(original_size);
+                app.table_focus.focus(window, cx); cx.notify();
+            }))?;
+            cx.background_executor().timer(Duration::from_millis(200)).await;
             window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap();
-                ensure!(view.read(cx).pane_width(window) + crate::DIVIDER <= f32::from(window.viewport_size().width) - 420., "Resized sidebar covered the Inbox");
+                check_staging_geometry(view.read(cx), window)?;
                 check_two_line_rows(view.read(cx))
             })??;
-            window.update(cx, |_, window, _| window.resize(original_size))?;
-            cx.background_executor().timer(Duration::from_millis(150)).await;
-            window.update(cx, |root, window, cx| {
-                root.downcast::<MailApp>().unwrap().update(cx, |this, cx| {
-                    check_two_line_rows(this).expect("Restoring the window width changed row height");
-                    this.sidebar_width = 320.; this.archive_fraction = 0.5;
-                    this.table_focus.focus(window); cx.notify();
-                });
-            })?;
             // Body keyboard selection shortcuts are gone. Keyboard selection uses checkbox controls.
             window.update(cx,|_,window,cx| {
                 for key in ["space", "shift-space", "ctrl-space"] { window.dispatch_keystroke(Keystroke::parse(key).unwrap(),cx); }
@@ -489,11 +636,12 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
                 let row = this.triage.rows("").into_iter().find(|row| row.ids.len() == 1 && row.ids.first() == read_before.2.as_ref()).unwrap();
-                this.row_focus[&row.key].focus(window);
+                let focus = this.row_focus[&row.key].clone();
                 let badges = this.row_labels(&row);
                 let budget = ((f32::from(this.table_bounds.size.width) - 90.) * 0.4).clamp(34., 220.);
                 let chips = badges.iter().take(crate::labels::visible_count(badges.len(), budget)).filter(|badge| badge.id.is_some()).count();
-                for _ in 0..4 + chips { window.focus_next(); }
+                focus.focus(window, cx);
+                for _ in 0..4 + chips * 2 { window.focus_next(cx); }
             })?;
             // Keyboard activation toggles the focused icon without activating the row.
             for (key, unread) in [("enter", false), ("space", true)] {
@@ -504,7 +652,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                         && this.triage.selection == read_before.0 && this.active_message == read_before.2, "Read icon keyboard toggle failed"); Ok(())
                 })??;
             }
-            window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().read(cx).table_focus.focus(window))?;
+            window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().read(cx).table_focus.clone().focus(window, cx))?;
             // Clicking the displayed row's checkbox keeps the same message loaded.
             let active = this.update(cx, |this, _| this.active_message.clone())?;
             window.update(cx, |root, window, cx| click_row(root.downcast::<MailApp>().unwrap().read(cx), window, 4, true))??;
@@ -602,10 +750,16 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 for key in ["end", "enter"] { window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx); }
             })?;
             this.update(cx, |this, _| { ensure!(this.triage.selection.len() == 15 && this.active_message == active, "Menu selection read or lost other checkmarks"); Ok(()) })??;
+            // Uncheck this group again: actions on a fully checked row target the entire checked batch.
+            window.update(cx, |_, window, cx| window.dispatch_keystroke(Keystroke::parse("shift-f10").unwrap(), cx))?;
+            window.update(cx, |_, window, cx| {
+                for key in ["end", "enter"] { window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx); }
+            })?;
+            this.update(cx, |this, _| { ensure!(this.triage.selection.len() == 12 && this.active_message == active, "Menu deselection changed other checkmarks or the preview"); Ok(()) })??;
             window.update(cx, |_, window, cx| window.dispatch_keystroke(Keystroke::parse("shift-f10").unwrap(), cx))?;
             window.update(cx, |_, window, cx| window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx))?;
             this.update(cx, |this, cx| {
-                ensure!(this.triage.marks.len() == 21 && this.triage.selection.len() == 12 && this.settings.rules.is_empty(), "Menu archive was not row-local");
+                ensure!(this.triage.marks.len() == 21 && this.triage.selection.len() == 12 && this.settings.rules.is_empty(), "Menu archive was not row-local: marks={}, checked={}", this.triage.marks.len(), this.triage.selection.len());
                 this.triage.unmark(&menu_row.ids); cx.notify(); Ok(())
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
@@ -663,7 +817,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                     let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
                     let middle = point(this.table_bounds.right() + px(this.widths(window).0 / 2.), from.y);
                     let target = if case == "outside" { point(px(-10.),px(-10.)) } else {
-                        point(this.bin_bounds.left()+px(100.), this.bin_bounds.top()+px(if action == Action::Archive { 40. } else { this.bin_height()*this.archive_fraction + crate::DIVIDER + 40. }))
+                        staging_drop_position(this, action)?
                     };
                     mouse(window, WM_MOUSEMOVE, 1, middle)?; mouse(window, WM_MOUSEMOVE, 1, target)?; mouse(window, WM_LBUTTONUP, 0, target)
                 })??;
@@ -671,6 +825,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 this.update(cx, |this, _| {
                     let cancel = matches!(case, "outside" | "escape" | "blocked" | "unknown");
                     ensure!(this.mail_drag.is_none() && this.active_message == active && this.settings.rules.is_empty(), "Drag cleanup/read/rule failure for {case}");
+                    ensure!(!this.sidebar_visible && !this.settings.staging_review_open, "Collapsed drop auto-expanded review for {case}");
                     if cancel { ensure!(this.triage.marks.len() == baseline.0 && this.triage.emails.len() == baseline.1, "Cancelled drop changed messages for {case}"); }
                     else if case == "auto" { ensure!(this.triage.marks.len() == baseline.0 && this.triage.emails.len() == baseline.1 - baseline.2.len(), "Drop ignored auto-apply"); }
                     else { ensure!(this.triage.marks.len() == baseline.0 + baseline.2.len() && baseline.2.iter().all(|id| this.triage.marks[id].action == action), "Drop target/scope incorrect for {case}"); }
@@ -689,36 +844,54 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             ensure!(after_interactions["scroll"] == scrolled["scroll"], "Menus or drags lost reader scroll");
             // Native focus must return to the host when a pane is hidden.
             browser.focus()?;
+            let reader_button = this.update(cx, |app, _| app.reader_toggle_bounds)?;
             window.update(cx, |_, window, _| {
-                let pos = point(window.viewport_size().width - px(62.), window.viewport_size().height - px(17.));
+                let pos = reader_button.center();
                 drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
-            ensure!(!visible(&browser)?, "Reader dock icon left its native child visible");
+            ensure!(!visible(&browser)?, "Top Hide reader button left its native child visible");
             window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap();
                 ensure!(view.read(cx).table_focus.is_focused(window), "Hide did not return logical focus to the list");
-                ensure!(!view.read(cx).settings.pane_visibility.reader, "Reader dock toggle did not save hidden state");
+                ensure!(!view.read(cx).settings.pane_visibility.reader && view.read(cx).reader_toggle_bounds == reader_button,
+                    "Top reader toggle did not save hidden state or moved between visibility states");
                 unsafe { ensure!(GetFocus() == GetActiveWindow(), "Native focus remained in the hidden child"); }
-                let pos = point(window.viewport_size().width - px(62.), window.viewport_size().height - px(17.));
+                let pos = view.read(cx).reader_toggle_bounds.center();
                 drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
             let reopened = crate::reader_check::probe(&browser).await?;
             ensure!(visible(&browser)? && reopened["scroll"] == scrolled["scroll"], "Reopening lost scroll or native visibility");
-            // Both right-dock buttons operate independently, including while the reader is open.
-            for shown in [false, true] {
-                window.update(cx, |_, window, _| {
-                    let pos = point(window.viewport_size().width - px(26.), window.viewport_size().height - px(17.));
-                    drag(window, pos, pos, pos)
+            // Bottom Review/Collapse is independent of the top reader toggle.
+            let review_before = this.update(cx, |app, _| (app.table_bounds.size.height, app.settings.pane_visibility.staging, app.staging_line_bounds))?;
+            for shown in [true, false] {
+                window.update(cx, |_, window, cx| {
+                    window.blur(cx);
+                    for _ in 0..2 { window.focus_prev(cx); }
+                    window.dispatch_keystroke(Keystroke::parse("space").unwrap(), cx);
+                })?;
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+                window.update(cx, |root, window, cx| {
+                    let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
+                    ensure!(app.sidebar_visible == shown && app.settings.staging_review_open == shown
+                        && app.settings.pane_visibility.staging == review_before.1 && app.reader_toggle_bounds == reader_button
+                        && app.reader_visible && app.settings.pane_visibility.reader && app.triage.marks.len() == 18,
+                        "Review toggle changed reader visibility, top button position, legacy settings, or pending work");
+                    check_staging_geometry(app, window)?;
+                    ensure!(app.staging_line_bounds == review_before.2
+                        && (if shown { app.table_bounds.size.height < review_before.0 } else { app.table_bounds.size.height == review_before.0 }),
+                        "Review moved the staging line or failed to recover list height");
+                    let bounds = browser.bounds()?;
+                    let body = bounds.position.to_logical::<f64>(window.scale_factor().into());
+                    let size = bounds.size.to_logical::<f64>(window.scale_factor().into());
+                    let bottom = if shown { app.bin_bounds.top() } else { app.workspace_bounds.bottom() };
+                    ensure!(body.y + size.height <= f64::from(f32::from(bottom)) + 2., "Native reader overlaps review or bottom line");
+                    Ok(())
                 })??;
-                cx.background_executor().timer(Duration::from_millis(150)).await;
-                this.update(cx, |this, _| {
-                    ensure!(this.sidebar_visible == shown && this.settings.pane_visibility.staging == shown
-                        && this.reader_visible && this.settings.pane_visibility.reader && this.triage.marks.len() == 18,
-                        "Staging dock icon changed reader visibility or pending work"); Ok(())
-                })??;
-                ensure!(visible(&browser)?, "Staging toggle hid the reader");
+                ensure!(visible(&browser)?, "Review toggle hid the reader");
+                let reviewed = crate::reader_check::probe(&browser).await?;
+                ensure!(reviewed["scroll"] == scrolled["scroll"], "Review expansion lost reader scroll");
             }
             // Rules hide the native child. A completed load while hidden must not reveal it.
             window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |this, cx| {
@@ -734,8 +907,8 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             ensure!(visible(&browser)?, "Returning to Inbox did not restore reader");
             window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
-                let (r, s) = this.widths(window);
-                let from = point(window.viewport_size().width - px(r + s + 1.5 * crate::DIVIDER), this.bin_bounds.top() + px(40.));
+                ensure!(this.widths(window).1 == 0., "Reader divider still reserves a third column");
+                let from = point(this.table_bounds.right() + px(crate::SCROLLBAR_WIDTH + crate::DIVIDER / 2.), this.table_bounds.top() + px(40.));
                 let to = point(from.x - px(40.), from.y);
                 drag(window, from, to, to)
             })??;
@@ -745,37 +918,71 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             this.update(cx, |this, _| {
                 ensure!(this.reader_width == 536. && this.settings.pane_widths.reader == 536, "Reader resize was not saved"); Ok(())
             })??;
+            // With no third column, 536px still fits the minimum window. Use a wider preference to exercise clamping.
+            this.update(cx, |app, cx| { app.reader_width = 760.; app.save_pane_layout(cx); cx.notify(); })?;
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            let wide = crate::reader_check::probe(&browser).await?;
             window.update(cx, |_, window, _| window.resize(gpui::size(px(1100.), px(600.))))?;
             cx.background_executor().timer(Duration::from_millis(200)).await;
             let smaller = crate::reader_check::probe(&browser).await?;
-            ensure!(smaller["width"].as_u64() < before["width"].as_u64(), "Embedded browser did not resize");
+            ensure!(smaller["width"].as_u64() < wide["width"].as_u64(), "Embedded browser did not resize when the reader exceeded the two-column budget");
             window.update(cx, |root, window, cx| {
                 let this = root.downcast::<MailApp>().unwrap(); let this = this.read(cx);
                 let (r, s) = this.widths(window);
-                ensure!(r+s+2.*crate::DIVIDER <= f32::from(window.viewport_size().width)-420.+0.01, "Panes overflow the list");
-                ensure!(this.settings.pane_widths.reader == 536, "Clamping overwrote saved preferred width"); Ok(())
+                ensure!(s == 0. && r + crate::DIVIDER <= f32::from(window.viewport_size().width)-420.+0.01, "Reader or obsolete staging column overflows the list");
+                ensure!(r < 760. && this.reader_width == 760. && this.settings.pane_widths.reader == 760, "Clamping overwrote saved preferred width"); Ok(())
             })??;
             window.update(cx, |_, window, _| window.resize(original_size))?;
             cx.background_executor().timer(Duration::from_millis(200)).await;
+            let restored_width = crate::reader_check::probe(&browser).await?;
+            ensure!(restored_width["width"] == wide["width"], "Restoring window size did not recover the preferred reader width");
+            this.update(cx, |app, cx| { app.reader_width = 536.; app.save_pane_layout(cx); cx.notify(); })?;
+            cx.background_executor().timer(Duration::from_millis(200)).await;
             browser.evaluate_script("window.scrollTo(0,80)")?;
             let layout_scroll = crate::reader_check::probe(&browser).await?;
-            let layout_before = this.update(cx, |this, _| (this.triage.work(), this.triage.selection.clone(), this.active_message.clone(), this.bin_bounds, this.settings.pane_widths.clone()))?;
-            // The new SVG button changes only reader placement, leaving staging on the right.
-            window.update(cx, |_, window, _| {
-                let pos = point(window.viewport_size().width - px(98.), window.viewport_size().height - px(17.));
+            let layout_before = this.update(cx, |this, _| (this.triage.work(), this.triage.selection.clone(), this.active_message.clone(), this.staging_line_bounds, this.settings.pane_widths.clone()))?;
+            // The measured top placement icon changes only reader placement, not staging.
+            window.update(cx, |root, window, cx| {
+                let pos = root.downcast::<MailApp>().unwrap().read(cx).reader_position_bounds.center();
                 drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(200)).await;
             window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
                 let body = browser.bounds()?.position.to_logical::<f64>(window.scale_factor().into());
-                ensure!(this.reader_below() && this.reader_visible && this.sidebar_visible, "Layout SVG did not place the reader below");
-                ensure!(this.bin_bounds == layout_before.3 && this.table_bounds.right() < this.bin_bounds.left(), "Bottom layout moved staging");
+                ensure!(this.reader_below() && this.reader_visible && !this.sidebar_visible, "Top placement icon did not place the reader below independently");
+                check_staging_geometry(this, window)?;
+                ensure!(this.staging_line_bounds == layout_before.3
+                    && this.table_bounds.right() + px(crate::SCROLLBAR_WIDTH) == this.workspace_bounds.right(), "Below layout moved staging or retained a third column");
                 ensure!((body.x - f64::from(f32::from(this.table_bounds.left()))).abs() < 2.
                     && body.y > f64::from(f32::from(this.table_bounds.bottom())), "Native reader is not below the list");
                 ensure!(this.triage.work() == layout_before.0 && this.triage.selection == layout_before.1
                     && this.active_message == layout_before.2 && this.settings.pane_widths == layout_before.4, "Changing placement changed mail or widths");
-                check_two_line_rows(this)?;
+                check_two_line_rows(this)
+            })??;
+            for shown in [true, false] {
+                window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |app, cx| app.command(Command::ToggleSidebar, window, cx)))?;
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+                window.update(cx, |root, window, cx| {
+                    let view = root.downcast::<MailApp>().unwrap(); let app = view.read(cx);
+                    check_staging_geometry(app, window)?;
+                    ensure!(app.sidebar_visible == shown && app.settings.staging_review_open == shown && app.reader_below() && app.reader_visible
+                        && app.staging_line_bounds == layout_before.3 && app.triage.work() == layout_before.0
+                        && app.triage.selection == layout_before.1 && app.active_message == layout_before.2
+                        && app.settings.pane_widths == layout_before.4 && app.settings.reader_height == 360,
+                        "Below reader and review expansion are not independent");
+                    let bounds = browser.bounds()?;
+                    let body = bounds.position.to_logical::<f64>(window.scale_factor().into());
+                    let size = bounds.size.to_logical::<f64>(window.scale_factor().into());
+                    let bottom = if shown { app.bin_bounds.top() } else { app.workspace_bounds.bottom() };
+                    ensure!(body.y >= f64::from(f32::from(app.table_bounds.bottom()))
+                        && body.y + size.height <= f64::from(f32::from(bottom)) + 2., "Below reader overlaps list, review, or bottom line");
+                    Ok(())
+                })??;
+                ensure!(visible(&browser)?, "Below review toggle hid the native reader");
+            }
+            window.update(cx, |root, window, cx| {
+                let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
                 let from = point(this.table_bounds.left() + px(200.), this.table_bounds.bottom() + px(crate::DIVIDER / 2.));
                 let to = point(from.x, from.y - px(40.));
                 drag(window, from, to, to)
@@ -811,8 +1018,8 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             })??;
             window.update(cx, |_, window, _| window.resize(original_size))?;
             cx.background_executor().timer(Duration::from_millis(200)).await;
-            window.update(cx, |_, window, _| {
-                let pos = point(window.viewport_size().width - px(98.), window.viewport_size().height - px(17.));
+            window.update(cx, |root, window, cx| {
+                let pos = root.downcast::<MailApp>().unwrap().read(cx).reader_position_bounds.center();
                 drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
@@ -820,24 +1027,26 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             // Enter and Space activate the SVG button too, without opening a hidden reader.
             window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |this, cx| this.command(Command::ToggleReader, window, cx)))?;
             cx.background_executor().timer(Duration::from_millis(150)).await;
-            window.update(cx, |_, window, _| {
-                let pos = point(window.viewport_size().width - px(98.), window.viewport_size().height - px(17.));
+            window.update(cx, |root, window, cx| {
+                let pos = root.downcast::<MailApp>().unwrap().read(cx).reader_position_bounds.center();
                 drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
-            window.update(cx, |_, window, _| {
-                window.blur();
-                for _ in 0..3 { window.focus_prev(); }
+            window.update(cx, |root, window, cx| {
+                let filter = root.downcast::<MailApp>().unwrap().read(cx).filter.clone();
+                filter.read(cx).focus_handle.clone().focus(window, cx);
+                // Empty filter, no selection or rules: Rules, Refresh, reader toggle, placement.
+                for _ in 0..4 { window.focus_next(cx); }
             })?;
             for (key, below) in [("enter", false), ("space", true)] {
                 window.update(cx, |_, window, cx| window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx))?;
-                this.update(cx, |this, _| { ensure!(this.reader_below() == below && !this.reader_visible && this.sidebar_visible, "Keyboard layout switch changed visibility or failed"); Ok(()) })??;
+                this.update(cx, |this, _| { ensure!(this.reader_below() == below && !this.reader_visible && !this.sidebar_visible, "Keyboard layout switch changed visibility or failed"); Ok(()) })??;
             }
             ensure!(!visible(&browser)?, "Layout switch reopened hidden reader");
             window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |this, cx| {
                 this.command(Command::ToggleReaderPosition, window, cx);
                 this.triage.selection.clear();
-                this.table_focus.focus(window); cx.notify();
+                this.table_focus.focus(window, cx); cx.notify();
             }))?;
             window.update(cx,|_,window,cx| {window.dispatch_keystroke(Keystroke::parse("ctrl-f").unwrap(),cx);})?;
             cx.background_executor().timer(Duration::from_millis(100)).await;
@@ -860,12 +1069,12 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             ] {
                 window.update(cx, |root, window, cx| root.downcast::<MailApp>().unwrap().update(cx, |this, cx| {
                     this.filter.update(cx, |input, cx| input.set(value, cx));
-                    this.filter.read(cx).focus_handle.focus(window);
+                    this.filter.read(cx).focus_handle.clone().focus(window, cx);
                 }))?;
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 window.update(cx, |_, window, cx| {
                     if let Some(key) = key {
-                        window.focus_next();
+                        window.focus_next(cx);
                         window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
                     } else {
                         let pos = point(px(188.), px(24.));
@@ -888,10 +1097,10 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             this.update(cx, |this, cx| this.filter.update(cx, |input, cx| input.set("", cx)))?;
             cx.background_executor().timer(Duration::from_millis(150)).await;
             window.update(cx, |root, window, cx| {
-                let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
-                this.filter.read(cx).focus_handle.focus(window);
-                window.focus_next();
-                ensure!(!this.filter.read(cx).focus_handle.contains_focused(window, cx), "Empty filter retained a clear-button tab stop");
+                let view = root.downcast::<MailApp>().unwrap(); let filter = view.read(cx).filter.clone();
+                filter.read(cx).focus_handle.clone().focus(window, cx);
+                window.focus_next(cx);
+                ensure!(!filter.read(cx).focus_handle.contains_focused(window, cx), "Empty filter retained a clear-button tab stop");
                 let pos = point(px(188.), px(24.)); drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
@@ -974,9 +1183,9 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                     let ready = window.update(cx, |root, window, cx| {
                         let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
                         let (reader, staging) = this.widths(window);
-                        let width = f32::from(window.viewport_size().width) - reader - staging - crate::SCROLLBAR_WIDTH
-                            - ((this.reader_visible && !below) as u8 + this.sidebar_visible as u8) as f32 * crate::DIVIDER;
-                        this.inbox_scrollbar.get().is_some_and(|bar| bar.top.abs() < 1.)
+                        let width = f32::from(window.viewport_size().width) - reader - crate::SCROLLBAR_WIDTH
+                            - (this.reader_visible && !below) as u8 as f32 * crate::DIVIDER;
+                        staging == 0. && this.inbox_scrollbar.get().is_some_and(|bar| bar.top.abs() < 1.)
                             && (f32::from(this.table_bounds.size.width) - width).abs() < 1.
                     })?;
                     if ready { break; }
@@ -984,6 +1193,11 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 window.update(cx, |root, window, cx| {
                     let view = root.downcast::<MailApp>().unwrap(); let this = view.read(cx);
                     let bar = this.inbox_scrollbar.get().ok_or_else(|| anyhow::anyhow!("Overflowing Inbox has no scrollbar"))?;
+                    let (reader, staging) = this.widths(window);
+                    let expected_width = f32::from(window.viewport_size().width) - reader - crate::SCROLLBAR_WIDTH
+                        - if below { 0. } else { crate::DIVIDER };
+                    ensure!(staging == 0. && (f32::from(this.table_bounds.size.width) - expected_width).abs() < 1.,
+                        "Scrollbar layout still subtracts a third column: below={below}, table={:?}, expected={expected_width}", this.table_bounds);
                     ensure!(bar.track.left() == this.table_bounds.right() && bar.track.size.height == this.table_bounds.size.height
                         && bar.top.abs() < 1., "Scrollbar is not aligned with the list or starts stale: below={below}, track={:?}, table={:?}, thumb={}", bar.track, this.table_bounds, bar.top);
                     let from = point(bar.track.left() + px(6.), bar.track.top() + px(bar.height / 2.));
@@ -1006,7 +1220,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                     let bar = this.inbox_scrollbar.get().unwrap();
                     let offset = -f32::from(this.scroll.0.borrow().base_handle.offset().y);
                     ensure!((offset - (bar.max_offset - f32::from(bar.track.size.height)).max(0.)).abs() < 1., "Scrollbar track click did not page up");
-                    this.table_focus.focus(window);
+                    this.table_focus.clone().focus(window, cx);
                     window.dispatch_keystroke(Keystroke::parse("home").unwrap(), cx);
                     Ok(())
                 })??;
@@ -1070,7 +1284,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 ]).output()
             }).await;
         }
-        let mut report=match result {Ok(())=>json!({"ok":true,"checkbox_selection":true,"expanded_group_checkbox":true,"inline_reader":true,"reading_preserves_checks":true,"preview_preserves_unread":true,"mark_read_row_local":true,"mark_unread_row_local":true,"read_icons_keyboard":true,"reader_hide_show":true,"reader_dock_icon":true,"independent_dock_icons":true,"keyboard_checkbox":true,"reader_focus_return":true,"row_action_scope":true,"trash_icon":true,"reader_scroll_preserved":true,"reader_resize":{"beside":true,"below":true,"svg_keyboard":true,"height_saved":true,"staging_stays_right":true},"preferred_width_preserved":true,"pane_visibility_saved":true,"row_menus":true,"two_line_rows_at_all_widths":true,"confirmed_sender_rules":true,"drag_scopes_and_cancel":true,"drag_across_reader":true,"drop_auto_apply":true,"labels_do_not_block_triage":true,"hidden_load_stays_hidden":true,"filter_input":true,"clear_filter":true,"clear_filter_keyboard":true,"clear_filter_undo":true,"undo":true,"ime_ranges":true,"rules":true,"staging":true,"modal_focus":true,"sidebar_resize":true,"bin_resize":true,"collapse_preserves_marks":true,"gmail_access":false}),Err(e)=>json!({"ok":false,"error":format!("{e:#}")})};
+        let mut report=match result {Ok(())=>json!({"ok":true,"checkbox_selection":true,"expanded_group_checkbox":true,"inline_reader":true,"reading_preserves_checks":true,"preview_preserves_unread":true,"mark_read_row_local":true,"mark_unread_row_local":true,"read_icons_keyboard":true,"reader_hide_show":true,"top_reader_button":true,"reader_review_independent":true,"keyboard_checkbox":true,"reader_focus_return":true,"row_action_scope":true,"trash_icon":true,"reader_scroll_preserved":true,"reader_resize":{"beside":true,"below":true,"svg_keyboard":true,"height_saved":true,"staging_stays_bottom":true},"preferred_width_preserved":true,"reader_and_review_visibility_saved":true,"row_menus":true,"two_line_rows_at_all_widths":true,"confirmed_sender_rules":true,"drag_scopes_and_cancel":true,"drag_across_reader":true,"drop_auto_apply":true,"labels_do_not_block_triage":true,"hidden_load_stays_hidden":true,"filter_input":true,"clear_filter":true,"clear_filter_keyboard":true,"clear_filter_undo":true,"undo":true,"ime_ranges":true,"rules":true,"staging":true,"modal_focus":true,"collapse_preserves_marks":true,"gmail_access":false}),Err(e)=>json!({"ok":false,"error":format!("{e:#}")})};
         if (scrollbar_only || middle_only || selected_actions_only || spaces_only || labels_only || reader_visibility_only || label_removal_only) && report["ok"] == true { report = json!({"ok":true,"gmail_access":false}); }
         if middle_only && report["ok"] == true {
             report["middle_selection"] = json!({"clicked_row_state":true,"filter_scope":true,"off_screen_messages":true,"partial_groups":true,"row_controls":true,"mail_unchanged":true});
@@ -1082,20 +1296,21 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
             report["spaces"] = if space_removal_only {
                 json!({"remove_saved_space":true,"pending_and_unknown_lock":true,"edit_and_write_lock":true,"unavailable_labels":true,"other_spaces_preserved":true,"mail_unchanged":true})
             } else {
-                json!({"inline_create_cancel":true,"fuzzy_keyboard_multiselect":true,"drag_checked_batch":true,"ignores_auto_apply":true,"label_edit_lock":true,"missing_label_blocks_apply":true,"put_back":true,"explicit_apply":true})
+                json!({"inline_create_cancel":true,"fuzzy_keyboard_multiselect":true,"drag_checked_batch":true,"collapsed_drop":true,"drop_preserves_collapsed_review":true,"space_editor_opens_review":true,"shallow_editor_scroll":true,"ignores_auto_apply":true,"label_edit_lock":true,"missing_label_blocks_apply":true,"put_back":true,"explicit_apply":true})
             };
         }
         if labels_only && report["ok"] == true {
             report["labels"] = json!({"hover_assignment":true,"hover_target_scope":true,"hover_anchor":true,"icon_filter_bar":true,"row_chip_filters":true,"or_labels":true,"idempotent_row_chips":true,"fuzzy_filter":true,"text_intersection":true,"group_scope":true,"remove_filter_keyboard":true,"immediate_assignment":true,"inbox_unread_preserved":true,"partial_results":true,"small_window":true,"floating_picker":true,"no_layout_shift":true,"outside_dismissal":true,"reader_overlay_restore":true});
         }
         if reader_visibility_only && report["ok"] == true {
-            report["reader_visibility"] = json!({"hidden_click":true,"hidden_enter":true,"visible_activation":true,"hidden_preview_preserved":true,"explicit_open":true});
+            report["reader_visibility"] = json!({"hidden_click_reveals":true,"hidden_enter_reveals":true,"visible_activation":true,"sender_groups_expand_without_reading":true,"checkbox_preserves_hidden_preview":true,"fixed_top_button":true,"hidden_preview_preserved":true,"scroll_preserved":true,"collapsed_geometry":true,"collapsed_outcome_recovery":true,"explicit_open":true});
         }
         if label_removal_only && report["ok"] == true {
             report["label_removal"] = json!({"single_immediate":true,"group_confirmation":true,"row_local_scope":true,"keyboard_badges":true,"cancel":true,"filtered_group_scope":true,"stale_targets":true,"partial_results":true,"hidden_checks_cleared":true});
         }
         if !middle_only && !selected_actions_only && !spaces_only && !labels_only && !reader_visibility_only && !label_removal_only && report["ok"] == true {
             report["inbox_scrollbar"] = json!({"drag":true,"track":true,"wheel_keyboard":true,"resize_filter":true,"both_layouts":true});
+            report["staging_review"] = json!({"bottom_line":true,"shallow_tray":true,"collapsed_apply_reachable":true,"collapsed_outcome_recovery":true});
         }
         let _=std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"),"/target/triage-check.json"),report.to_string());
         let _=cx.update(|cx|cx.quit());

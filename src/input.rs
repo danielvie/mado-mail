@@ -45,6 +45,7 @@ pub struct TextInput {
     pub content: SharedString,
     pub tab_stop: bool,
     pub clearable: bool,
+    pub palette: Option<Palette>,
     pub placeholder: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -91,6 +92,7 @@ impl TextInput {
             content: "".into(),
             tab_stop: true,
             clearable: false,
+            palette: None,
             placeholder: placeholder.to_owned().into(),
             selected_range: 0..0,
             selection_reversed: false,
@@ -116,7 +118,7 @@ impl TextInput {
         self.marked_range = None;
         let range = 0..self.content.encode_utf16().count();
         self.replace_text_in_range(Some(range), "", window, cx);
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
     }
     fn checkpoint(&mut self) {
         if self.marked_range.is_none() {
@@ -217,7 +219,7 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         self.is_selecting = true;
         if event.click_count >= 3 {
             self.move_to(0, cx);
@@ -562,8 +564,8 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let p = Palette::current(cx);
         let input = self.input.read(cx);
+        let p = input.palette.unwrap_or_else(|| Palette::current(cx));
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
@@ -676,6 +678,8 @@ impl Element for TextElement {
         line.paint(
             point(bounds.left() - prepaint.scroll_x, bounds.top()),
             window.line_height(),
+            gpui::TextAlign::Left,
+            None,
             window,
             cx,
         )
@@ -697,17 +701,19 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = Palette::current(cx);
+        let p = self.palette.unwrap_or_else(|| Palette::current(cx));
         div()
             .flex()
             .items_center()
+            .bg(p.panel)
+            .text_color(p.ink)
             .key_context("TextInput")
             .id("text-input")
             .tab_index(0)
             .tab_stop(self.tab_stop)
             .track_focus(&self.focus_handle(cx).tab_index(0).tab_stop(self.tab_stop))
             .border_1()
-            .border_color(p.ink_dim)
+            .border_color(if self.palette.is_some() { p.line } else { p.ink_dim })
             .rounded_sm()
             .focus(|s| s.border_color(p.accent))
             .overflow_hidden()
@@ -825,5 +831,15 @@ mod tests {
         assert_eq!(utf16_offset(text, 3), 5);
         assert_eq!(utf16_offset(text, 4), 7);
         assert_eq!(utf16_offset(text, 100), text.len());
+    }
+    #[test]
+    fn utf16_offsets_do_not_split_surrogate_pairs() {
+        let text = "a\u{1f680}é";
+        for (units, bytes) in [0, 1, 5, 5, 7].into_iter().enumerate() {
+            assert_eq!(utf16_offset(text, units), bytes);
+            assert!(text.is_char_boundary(bytes));
+        }
+        assert_eq!(utf16_offset(text, usize::MAX), text.len());
+        assert_eq!(utf16_offset("", usize::MAX), 0);
     }
 }

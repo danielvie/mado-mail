@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod color_check;
 mod gmail;
 mod icons;
 mod input;
@@ -9,6 +10,7 @@ mod message;
 mod reader;
 mod reader_check;
 mod settings;
+mod staging_ui;
 mod spaces;
 mod space_ui;
 mod theme;
@@ -18,7 +20,7 @@ mod triage_check;
 use anyhow::{Context as _, Result};
 use gmail::{Email, Session, SharedSession, SignIn};
 use gpui::{
-    App, Application, Bounds, Context, CursorStyle, DispatchPhase, Entity, FocusHandle, KeyBinding,
+    App, Bounds, Context, CursorStyle, DispatchPhase, Entity, FocusHandle, KeyBinding,
     MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptLevel,
     ScrollStrategy, SharedString, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
     WindowOptions, actions, canvas, div, prelude::*, px, size, uniform_list,
@@ -63,34 +65,18 @@ struct InboxScrollGeometry {
     height: f32,
     max_offset: f32,
 }
-fn pane_widths(viewport: f32, reader: Option<f32>, staging: Option<f32>) -> (f32, f32) {
-    let r_min = if reader.is_some() { 320. } else { 0. };
-    let s_min = if staging.is_some() { 260. } else { 0. };
-    let r = reader.map_or(0., |v| v.clamp(r_min, 8192.));
-    let s = staging.map_or(0., |v| v.clamp(s_min, 8192.));
-    let dividers = (reader.is_some() as u8 + staging.is_some() as u8) as f32 * DIVIDER;
-    let budget = (viewport - 420. - dividers).max(r_min + s_min);
-    let extra = r + s - r_min - s_min;
-    if r + s > budget && extra > 0. {
-        let scale = (budget - r_min - s_min) / extra;
-        (r_min + (r - r_min) * scale, s_min + (s - s_min) * scale)
-    } else {
-        (r, s)
-    }
+fn pane_widths(viewport: f32, reader: Option<f32>) -> (f32, f32) {
+    let width = reader.map_or(0., |preferred| preferred.clamp(320., 8192.)
+        .min((viewport - 420. - DIVIDER).max(320.)));
+    (width, 0.)
 }
 fn reader_height(available: f32, preferred: f32) -> f32 {
     preferred.clamp(240., 8192.).min((available - 160. - DIVIDER).max(0.))
 }
-fn clamp_archive_fraction(fraction: f32, height: f32) -> f32 {
-    let min = (80. / height.max(1.)).min(0.5);
-    fraction.clamp(min, 1. - min)
-}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResizeAxis {
-    Width,
     Reader,
     ReaderHeight,
-    Bins,
 }
 #[derive(Clone, Copy)]
 struct ResizeDrag {
@@ -213,6 +199,10 @@ struct MailApp {
     label_row_targets: Option<(String, Vec<String>)>,
     label_row_anchors: BTreeMap<String, Bounds<Pixels>>,
     staging_scroll: gpui::ScrollHandle,
+    staging_targets: Vec<(Action, Bounds<Pixels>)>,
+    staging_line_bounds: Bounds<Pixels>,
+    reader_toggle_bounds: Bounds<Pixels>,
+    reader_position_bounds: Bounds<Pixels>,
     session: Option<SharedSession>,
     reader: Option<Entity<Reader>>,
     active_message: Option<String>,
@@ -236,6 +226,9 @@ struct MailApp {
     suppress_row_click: bool,
     settings: Settings,
     settings_path: PathBuf,
+    settings_revision: u64,
+    _color_reload_task: Option<gpui::Task<()>>,
+    color_reload_error: Option<String>,
     journal_path: PathBuf,
     busy: bool,
     blocked: bool,
@@ -252,13 +245,10 @@ struct MailApp {
     inbox_scroll_drag: Option<f32>,
     sidebar_visible: bool,
     sidebar_width: f32,
-    archive_fraction: f32,
     bin_bounds: Bounds<Pixels>,
     table_bounds: Bounds<Pixels>,
     resize_drag: Option<ResizeDrag>,
-    width_focus: FocusHandle,
     reader_width_focus: FocusHandle,
-    split_focus: FocusHandle,
 }
 impl MailApp {
     fn new(window: &mut Window, cx: &mut Context<Self>, demo: bool) -> Self {
@@ -353,7 +343,7 @@ impl MailApp {
         }
         let focus = cx.focus_handle();
         let table_focus = cx.focus_handle();
-        table_focus.focus(window);
+        table_focus.focus(window, cx);
         let status = if let Some(ref e) = error {
             e.clone()
         } else if demo {
@@ -383,11 +373,15 @@ impl MailApp {
             label_row_targets: None,
             label_row_anchors: BTreeMap::new(),
             staging_scroll: gpui::ScrollHandle::new(),
+            staging_targets: Vec::new(),
+            staging_line_bounds: Bounds::default(),
+            reader_toggle_bounds: Bounds::default(),
+            reader_position_bounds: Bounds::default(),
             session: None,
             reader: None,
             active_message: None,
             reader_visible: settings.pane_visibility.reader,
-            sidebar_visible: settings.pane_visibility.staging,
+            sidebar_visible: settings.staging_review_open,
             reader_width: settings.pane_widths.reader as f32,
             reader_height: settings.reader_height as f32,
             workspace_bounds: Bounds::default(),
@@ -408,6 +402,9 @@ impl MailApp {
             suppress_row_click: false,
             settings,
             settings_path,
+            settings_revision: 0,
+            _color_reload_task: None,
+            color_reload_error: None,
             journal_path,
             busy: false,
             blocked: error.is_some(),
@@ -422,13 +419,47 @@ impl MailApp {
             scroll: UniformListScrollHandle::new(),
             inbox_scrollbar: Rc::new(Cell::new(None)),
             inbox_scroll_drag: None,
-            archive_fraction: 0.5,
             bin_bounds: Bounds::default(),
             table_bounds: Bounds::default(),
             resize_drag: None,
-            width_focus: cx.focus_handle(),
             reader_width_focus: cx.focus_handle(),
-            split_focus: cx.focus_handle(),
+        }
+    }
+    fn watch_colors(&mut self, cx: &mut Context<Self>) {
+        let path = self.settings_path.clone();
+        // Keeping the task on the view cancels polling when the Inbox closes.
+        // https://docs.rs/gpui-pre/0.3.11/gpui/struct.Task.html
+        self._color_reload_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let Ok((theme, revision)) = this.update(cx, |app, _| (app.settings.theme.clone(), app.settings_revision)) else { break; };
+                let file = path.clone();
+                let name = theme.clone();
+                let result = cx.background_executor().spawn(async move { settings::load_colors(&file, &name) }).await;
+                if this.update(cx, |app, cx| app.reloaded_colors(&theme, revision, result, cx)).is_err() { break; }
+            }
+        }));
+    }
+    fn reloaded_colors(&mut self, theme: &str, revision: u64, result: Result<Palette>, cx: &mut Context<Self>) {
+        // In-app saves can replace the file even when they leave the palette unchanged.
+        if self.settings.theme != theme || self.settings_revision != revision { return; }
+        let previous = self.settings.palette();
+        match result {
+            Ok(colors) => {
+                let recovered = self.color_reload_error.take().is_some();
+                if colors != previous {
+                    self.settings.themes.insert(theme.to_owned(), colors);
+                    colors.apply(cx);
+                }
+                if recovered || colors != previous { cx.notify(); }
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                if self.color_reload_error.as_ref() != Some(&error) {
+                    self.color_reload_error = Some(error);
+                    cx.notify();
+                }
+            }
         }
     }
     fn error(&mut self, error: impl std::fmt::Display, cx: &mut Context<Self>) {
@@ -461,8 +492,9 @@ impl MailApp {
         self.reader_height = next.reader_height as f32;
         self.sidebar_width = next.pane_widths.staging as f32;
         self.reader_visible = next.pane_visibility.reader;
-        self.sidebar_visible = next.pane_visibility.staging;
+        self.sidebar_visible = next.staging_review_open;
         self.settings = next;
+        self.settings_revision += 1;
         self.settings.palette().apply(cx);
         cx.notify();
         true
@@ -814,7 +846,6 @@ impl MailApp {
         cx.notify();
     }
     fn import(&mut self, cx: &mut Context<Self>) {
-        let current = self.settings.clone();
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -822,7 +853,7 @@ impl MailApp {
             prompt: Some("Import Mado Mail rules or settings".into()),
         });
         cx.spawn(async move |this,cx| {
-            let result=async {let paths=picker.await??;let Some(path)=paths.and_then(|p|p.into_iter().next()) else {return anyhow::Ok(None)};let bytes=settings::read_bounded(&path)?;Ok(Some(Settings::decode_import(&bytes, &current)?))}.await;
+            let result=async {let paths=picker.await??;let Some(path)=paths.and_then(|p|p.into_iter().next()) else {return anyhow::Ok(None)};let bytes=settings::read_bounded(&path)?;let current=this.update(cx,|this,_|this.settings.clone())?;Ok(Some(Settings::decode_import(&bytes, &current)?))}.await;
             let _=this.update(cx,|this,cx|match result {
                 Ok(Some(settings))=>{
                     if this.busy || this.space_draft.is_some() || this.triage.marks.values().any(|mark| matches!(mark.action, Action::Space(_))) {this.error("Finish space edits and pending space messages before importing.",cx);return;}
@@ -898,11 +929,11 @@ impl MailApp {
         self.row_menu = Some(RowMenu { row: rows[index].clone(), anchor, selected: if self.can_stage() { 0 } else { 3 } });
         self.peek = None; self.hovered = None;
         if let Some(reader) = &self.reader { reader.read(cx).focus_host(); }
-        self.menu_focus.focus(window); cx.notify();
+        self.menu_focus.focus(window, cx); cx.notify();
     }
     fn close_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.row_menu = None;
-        let focus = self.table_focus.clone(); window.defer(cx, move |window, _| focus.focus(window)); cx.notify();
+        let focus = self.table_focus.clone(); window.defer(cx, move |window, cx| focus.focus(window, cx)); cx.notify();
     }
     fn menu_action(&mut self, action: usize, window: &mut Window, cx: &mut Context<Self>) {
         if action < 3 && !self.can_stage() { return; }
@@ -917,7 +948,7 @@ impl MailApp {
                 self.editing = Some((None, Action::Archive));
                 self.rule_input.update(cx, |i, cx| i.set(&sender_address(&row.sender), cx));
                 let focus = self.rule_input.read(cx).focus_handle.clone();
-                window.defer(cx, move |window, _| focus.focus(window));
+                window.defer(cx, move |window, cx| focus.focus(window, cx));
             }
             3 => {
                 if row.ids.len() == 1 { self.open_message(&row.ids[0], window, cx); }
@@ -964,7 +995,7 @@ impl MailApp {
             Command::PickTopLabel(id) => self.pick_top_label(id, cx),
             Command::RemoveRowLabel(key, label) => self.request_label_removal(&key, label, window, cx),
             Command::ConfirmLabelRemoval => self.confirm_label_removal(window, cx),
-            Command::CancelLabelRemoval => { self.label_removal = None; self.table_focus.focus(window); }
+            Command::CancelLabelRemoval => { self.label_removal = None; self.table_focus.focus(window, cx); }
             Command::RemoveLabelFilter(id) => {
                 if self.triage.label_filter.contains(&id) { self.change_label_filter(id, cx); }
             }
@@ -972,19 +1003,19 @@ impl MailApp {
                 if !self.triage.label_filter.contains(&id) { self.change_label_filter(id, cx); }
                 self.label_picker = None;
                 self.label_row_targets = None;
-                self.table_focus.focus(window);
+                self.table_focus.focus(window, cx);
             }
-            Command::CloseLabelPicker => { self.label_picker = None; self.label_row_targets = None; self.table_focus.focus(window); }
+            Command::CloseLabelPicker => { self.label_picker = None; self.label_row_targets = None; self.table_focus.focus(window, cx); }
             Command::NewSpace => self.edit_space(None, window, cx),
             Command::EditSpace(id) => self.edit_space(Some(id), window, cx),
             Command::RemoveSpace(id) => self.remove_space(id, window, cx),
             Command::SaveSpace => self.save_space(window, cx),
-            Command::CancelSpace => { self.space_draft = None; self.table_focus.focus(window); }
+            Command::CancelSpace => { self.space_draft = None; self.table_focus.focus(window, cx); }
             Command::SpacePicker => {
                 if let Some(draft) = &mut self.space_draft {
                     draft.picker = !draft.picker;
-                    if draft.picker { self.space_query.read(cx).focus_handle.focus(window); }
-                    else { self.space_name.read(cx).focus_handle.focus(window); }
+                    if draft.picker { self.space_query.read(cx).focus_handle.clone().focus(window, cx); }
+                    else { self.space_name.read(cx).focus_handle.clone().focus(window, cx); }
                 }
             }
             Command::SpaceLabel(id) => self.toggle_space_label(id, cx),
@@ -1055,7 +1086,7 @@ impl MailApp {
                 self.resize_drag = None;
                 self.save_pane_layout(cx);
                 let focus = self.table_focus.clone();
-                window.defer(cx, move |window, _| focus.focus(window));
+                window.defer(cx, move |window, cx| focus.focus(window, cx));
             }
             Command::ToggleReaderPosition => {
                 if self.rules_view { return; }
@@ -1076,7 +1107,7 @@ impl MailApp {
                 self.save_pane_layout(cx);
                 self.peek = None;
                 self.hovered = None;
-                self.table_focus.focus(window);
+                self.table_focus.focus(window, cx);
             }
             Command::Theme => {
                 let mut s = self.settings.clone();
@@ -1090,7 +1121,7 @@ impl MailApp {
                     let from = r.from.clone();
                     self.editing = Some((Some(i), r.action));
                     self.rule_input.update(cx, |i, cx| i.set(&from, cx));
-                    self.rule_input.read(cx).focus_handle.focus(window);
+                    self.rule_input.read(cx).focus_handle.clone().focus(window, cx);
                 }
             }
             Command::DropRule(i) => {
@@ -1108,12 +1139,12 @@ impl MailApp {
                         s.rules[i].from = from; s.rules[i].action = action;
                         self.save_settings(s, cx)
                     } else { self.save_sender_rule(from, action, cx) };
-                    if saved { self.editing = None; self.table_focus.focus(window); }
+                    if saved { self.editing = None; self.table_focus.focus(window, cx); }
                 }
             }
             Command::CancelEdit => {
                 self.editing = None;
-                self.table_focus.focus(window);
+                self.table_focus.focus(window, cx);
             }
             Command::EditAction(action) => {
                 if let Some((_, a)) = &mut self.editing {
@@ -1137,6 +1168,16 @@ impl MailApp {
         }
         cx.notify();
     }
+    fn header_button(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        command: Command,
+        enabled: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.styled_button(id, label, command, enabled, true, cx)
+    }
     fn button(
         &self,
         id: impl Into<SharedString>,
@@ -1145,7 +1186,19 @@ impl MailApp {
         enabled: bool,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        self.styled_button(id, label, command, enabled, false, cx)
+    }
+    fn styled_button(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        command: Command,
+        enabled: bool,
+        header: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let p = Palette::current(cx);
+        let p = if header { p.header() } else { p };
         let label: SharedString = label.into();
         let chevron = match &command {
             Command::Expand(sender) => {
@@ -1156,8 +1209,8 @@ impl MailApp {
                 })
             }
             Command::SpacePicker | Command::EditSpace(_) => Some("icons/label.svg"),
-            Command::ToggleSidebar => Some("icons/sidebar-right.svg"),
-            Command::ToggleReader => Some("icons/reader.svg"),
+            Command::ToggleSidebar if label.is_empty() => Some("icons/sidebar-right.svg"),
+            Command::ToggleReader if label.is_empty() => Some("icons/reader.svg"),
             Command::ToggleReaderPosition => Some(if self.reader_below() { "icons/reader-beside.svg" } else { "icons/reader-below.svg" }),
             _ => None,
         };
@@ -1171,8 +1224,8 @@ impl MailApp {
             (Command::ToggleReader, true) => "Hide reader",
             (Command::ToggleReader, false) => "Show reader",
             (Command::ToggleReaderPosition, _) => if self.reader_below() { "Place reader beside the list" } else { "Place reader below the list" },
-            (_, true) => "Hide staging pane",
-            (_, false) => "Show staging pane",
+            (_, true) => "Collapse staging review",
+            (_, false) => "Review pending decisions",
         };
         let toggle = matches!(command, Command::AutoApply);
         let key_command = command.clone();
@@ -1210,7 +1263,7 @@ impl MailApp {
             .when(matches!(command, Command::SpacePicker | Command::EditSpace(_)), |d| d.tooltip(|_, cx| cx.new(|_| Hint("Select space labels / fuzzy find")).into()))
             .when(dock_toggle, |d| {
                 d.when(dock_active, |d| d.bg(p.accent.opacity(0.12)))
-                    .tooltip(move |_, cx| cx.new(|_| Hint(dock_hint)).into())
+                    .when(label.is_empty(), |d| d.tooltip(move |_, cx| cx.new(|_| Hint(dock_hint)).into()))
             })
             .when(toggle, |d| {
                 d.flex().items_center().gap_2().child(icons::checkbox(
@@ -1227,6 +1280,7 @@ impl MailApp {
                 if row_action { s.bg(p.accent.opacity(0.14)) } else { s }
             })
             .hover(|s| {
+                if header { return s.bg(p.line).border_color(p.line); }
                 let s = s.border_color(p.accent);
                 if row_action { s.bg(p.accent.opacity(0.14)) } else { s }
             })
@@ -1325,7 +1379,7 @@ impl MailApp {
             .when(can_stage, |d| d.on_drag(MailDrag { ids, senders }, move |payload, offset, window, cx| {
                 let _ = drag_view.update(cx, |this, cx| {
                     this.mail_drag = Some(payload.clone()); this.suppress_row_click = true; this.row_menu = None;
-                    this.peek = None; this.hovered = None; this.table_focus.focus(window);
+                    this.peek = None; this.hovered = None; this.table_focus.focus(window, cx);
                     if let Some(reader) = &this.reader { reader.update(cx, |r, cx| r.set_visible(false, cx)); }
                     cx.notify();
                 });
@@ -1362,7 +1416,7 @@ impl MailApp {
                 let rows = this.triage.rows(&this.filter.read(cx).content);
                 this.triage.select_all_or_clear(&rows, &middle_key);
                 this.cursor = index;
-                this.table_focus.focus(window);
+                this.table_focus.focus(window, cx);
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, window, cx| {
@@ -1370,7 +1424,7 @@ impl MailApp {
             }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation(); if this.suppress_row_click { return; }
-                this.table_focus.focus(window); this.cursor = index; this.activate_row(&click_row, window, cx);
+                this.table_focus.focus(window, cx); this.cursor = index; this.activate_row(&click_row, window, cx);
             }))
             .child(div().id(SharedString::from(format!("check-{}", row.key))).tab_index(0).tab_stop(self.editing.is_none())
                 .w(px(28.)).h_full().flex_shrink_0().flex().items_center().justify_center().border_1()
@@ -1432,8 +1486,8 @@ impl MailApp {
     }
     fn activate_row(&mut self, row: &Row, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.is_some() { return; }
-        if row.ids.len() == 1 {
-            if self.reader_visible { self.open_message(&row.ids[0], window, cx); }
+        if row.ids.len() == 1 && !row.header {
+            self.open_message(&row.ids[0], window, cx);
         } else {
             self.command(Command::Expand(row.sender.clone()), window, cx);
         }
@@ -1467,7 +1521,7 @@ impl MailApp {
             }
             _ => return,
         }
-        self.table_focus.focus(window);
+        self.table_focus.focus(window, cx);
         cx.stop_propagation();
         self.scroll
             .scroll_to_item(self.cursor, ScrollStrategy::Center);
@@ -1483,7 +1537,7 @@ impl MailApp {
                 if this.editing.is_some() { return; }
                 let Some(bar) = this.inbox_scrollbar.get() else { return; };
                 cx.stop_propagation();
-                this.table_focus.focus(window);
+                this.table_focus.focus(window, cx);
                 this.row_menu = None;
                 this.hovered_row = None;
                 let y = f32::from(event.position.y - bar.track.top());
@@ -1497,7 +1551,7 @@ impl MailApp {
                 cx.notify();
             }))
             .on_click(|_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, event: &gpui::ScrollEvent, _, cx| {
                 if this.editing.is_some() { return; }
                 let current = -f32::from(this.scroll.0.borrow().base_handle.offset().y);
                 this.scroll_inbox_to(current - f32::from(event.delta.pixel_delta(px(20.)).y));
@@ -1541,14 +1595,14 @@ impl MailApp {
     }
     fn reader_below(&self) -> bool { self.settings.reader_position == ReaderPosition::Below }
     fn reader_height(&self) -> f32 {
-        reader_height(self.workspace_bounds.size.height.into(), self.reader_height)
+        let available = f32::from(self.workspace_bounds.size.height);
+        let review = if self.sidebar_visible { staging_ui::tray_height(available) } else { 0. };
+        reader_height(available - review, self.reader_height)
     }
     fn widths(&self, window: &Window) -> (f32, f32) {
         pane_widths(window.viewport_size().width.into(),
-            (self.reader_visible && !self.reader_below()).then_some(self.reader_width),
-            self.sidebar_visible.then_some(self.sidebar_width))
+            (self.reader_visible && !self.reader_below()).then_some(self.reader_width))
     }
-    fn pane_width(&self, window: &Window) -> f32 { self.widths(window).1 }
     fn save_pane_layout(&mut self, cx: &mut Context<Self>) {
         let mut next = self.settings.clone();
         next.pane_widths = settings::PaneWidths {
@@ -1556,19 +1610,15 @@ impl MailApp {
             staging: self.sidebar_width.round() as u32,
         };
         next.reader_height = self.reader_height.round() as u32;
-        next.pane_visibility = settings::PaneVisibility {
-            reader: self.reader_visible,
-            staging: self.sidebar_visible,
-        };
+        next.pane_visibility.reader = self.reader_visible;
+        next.staging_review_open = self.sidebar_visible;
         if next.pane_widths != self.settings.pane_widths
             || next.pane_visibility != self.settings.pane_visibility
             || next.reader_height != self.settings.reader_height
+            || next.staging_review_open != self.settings.staging_review_open
         {
             self.save_settings(next, cx);
         }
-    }
-    fn bin_height(&self) -> f32 {
-        (f32::from(self.bin_bounds.size.height) - DIVIDER).max(1.)
     }
     fn resize_pane(
         &mut self,
@@ -1578,21 +1628,12 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) {
         match axis {
-            ResizeAxis::Width | ResizeAxis::Reader => {
-                let (reader, staging) = self.widths(window);
-                let dividers = ((self.reader_visible && !self.reader_below()) as u8 + self.sidebar_visible as u8) as f32 * DIVIDER;
-                let budget = f32::from(window.viewport_size().width) - 420. - dividers;
-                if axis == ResizeAxis::Reader {
-                    self.reader_width = value.clamp(320., (budget - staging).max(320.).min(8192.));
-                } else {
-                    self.sidebar_width = value.clamp(260., (budget - reader).max(260.).min(8192.));
-                }
+            ResizeAxis::Reader => {
+                let budget = f32::from(window.viewport_size().width) - 420. - DIVIDER;
+                self.reader_width = value.clamp(320., budget.max(320.).min(8192.));
             }
             ResizeAxis::ReaderHeight => {
                 self.reader_height = reader_height(self.workspace_bounds.size.height.into(), value).max(240.);
-            }
-            ResizeAxis::Bins => {
-                self.archive_fraction = clamp_archive_fraction(value, self.bin_height())
             }
         }
         self.peek = None;
@@ -1618,11 +1659,8 @@ impl MailApp {
             cx.notify();
         } else {
             let value = match drag.axis {
-                ResizeAxis::Width | ResizeAxis::Reader => drag.value + f32::from(drag.start.x - event.position.x),
+                ResizeAxis::Reader => drag.value + f32::from(drag.start.x - event.position.x),
                 ResizeAxis::ReaderHeight => drag.value + f32::from(drag.start.y - event.position.y),
-                ResizeAxis::Bins => {
-                    drag.value + f32::from(event.position.y - drag.start.y) / self.bin_height()
-                }
             };
             self.resize_pane(drag.axis, value, window, cx);
         }
@@ -1630,24 +1668,16 @@ impl MailApp {
     }
     fn splitter(&self, axis: ResizeAxis, cx: &Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
-        let horizontal = matches!(axis, ResizeAxis::Width | ResizeAxis::Reader);
-        let focus = match axis {
-            ResizeAxis::Width => self.width_focus.clone(),
-            ResizeAxis::Reader | ResizeAxis::ReaderHeight => self.reader_width_focus.clone(),
-            ResizeAxis::Bins => self.split_focus.clone(),
-        };
+        let horizontal = axis == ResizeAxis::Reader;
+        let focus = self.reader_width_focus.clone();
         let hint = match axis {
-            ResizeAxis::Width => "Resize staging width. Drag or use Left/Right. Size is remembered.",
             ResizeAxis::Reader => "Resize reader width. Drag or use Left/Right. Size is remembered.",
             ResizeAxis::ReaderHeight => "Resize reader height. Drag or use Up/Down. Size is remembered.",
-            ResizeAxis::Bins => "Resize Archive/Trash sections. Drag or use Up/Down.",
         };
         div()
             .id(match axis {
-                ResizeAxis::Width => "staging-width-divider",
                 ResizeAxis::Reader => "reader-width-divider",
                 ResizeAxis::ReaderHeight => "reader-height-divider",
-                ResizeAxis::Bins => "staging-bin-divider",
             })
             .tab_index(0)
             .track_focus(&focus.clone().tab_index(0).tab_stop(self.editing.is_none()))
@@ -1674,12 +1704,10 @@ impl MailApp {
                     if this.editing.is_some() {
                         return;
                     }
-                    focus.focus(window);
+                    focus.focus(window, cx);
                     let value = match axis {
-                        ResizeAxis::Width => this.pane_width(window),
                         ResizeAxis::Reader => this.widths(window).0,
                         ResizeAxis::ReaderHeight => this.reader_height(),
-                        ResizeAxis::Bins => clamp_archive_fraction(this.archive_fraction, this.bin_height()),
                     };
                     this.resize_drag = Some(ResizeDrag {
                         axis,
@@ -1695,15 +1723,13 @@ impl MailApp {
             .on_key_down(
                 cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                     let delta = match (axis, event.keystroke.key.as_str()) {
-                        (ResizeAxis::Width | ResizeAxis::Reader, "left") | (ResizeAxis::Bins, "down") | (ResizeAxis::ReaderHeight, "up") => 16.,
-                        (ResizeAxis::Width | ResizeAxis::Reader, "right") | (ResizeAxis::Bins, "up") | (ResizeAxis::ReaderHeight, "down") => -16.,
+                        (ResizeAxis::Reader, "left") | (ResizeAxis::ReaderHeight, "up") => 16.,
+                        (ResizeAxis::Reader, "right") | (ResizeAxis::ReaderHeight, "down") => -16.,
                         _ => return,
                     };
                     let value = match axis {
-                        ResizeAxis::Width => this.pane_width(window) + delta,
                         ResizeAxis::Reader => this.widths(window).0 + delta,
                         ResizeAxis::ReaderHeight => this.reader_height() + delta,
-                        ResizeAxis::Bins => this.archive_fraction + delta / this.bin_height(),
                     };
                     this.resize_pane(axis, value, window, cx);
                     this.save_pane_layout(cx);
@@ -1717,296 +1743,6 @@ impl MailApp {
                     .when(horizontal, |d| d.w(px(2.)).h(px(32.)))
                     .when(!horizontal, |d| d.h(px(2.)).w(px(32.))),
             )
-    }
-    fn bins(&self, width: f32, cx: &Context<Self>) -> impl IntoElement {
-        let p = Palette::current(cx);
-        let mut actions = vec![Action::Archive, Action::Trash];
-        actions.extend(self.settings.spaces.iter().map(|space| Action::Space(space.id)));
-        for mark in self.triage.marks.values() {
-            if !actions.contains(&mark.action) { actions.push(mark.action); }
-        }
-        let with_spaces = actions.len() > 2 || self.space_draft.is_some();
-        let stacked = with_spaces;
-        let mut panel = div()
-            .w(px(width))
-            .flex_shrink_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(p.panel)
-            .border_l_1()
-            .border_color(p.line)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .p_3()
-                    .child(format!("STAGING / {} pending", self.triage.marks.len()))
-                    .child(self.button("new-space", "+ New space", Command::NewSpace, !self.busy && !self.blocked && self.space_draft.is_none() && !self.triage.has_unknown(), cx))
-                    .child(self.button(
-                        "empty",
-                        "Empty all",
-                        Command::Empty,
-                        !self.busy && !self.triage.marks.is_empty(),
-                        cx,
-                    )),
-            );
-        let view = cx.weak_entity();
-        let fraction = clamp_archive_fraction(self.archive_fraction, self.bin_height());
-        let mut bins = div().id("staging-bins").relative().flex_1().min_h_0().flex().flex_col()
-            .when(stacked, |d| d.overflow_y_scroll().track_scroll(&self.staging_scroll)).child(
-            canvas(
-                move |bounds, _, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        let changed = this.bin_bounds.size.height != bounds.size.height;
-                        this.bin_bounds = bounds;
-                        if changed {
-                            cx.notify();
-                        }
-                    });
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .inset_0(),
-        );
-        if self.space_draft.is_some() { bins = bins.child(self.space_editor(cx)); }
-        for action in actions {
-            if let Action::Space(id) = action {
-                if self.space_draft.as_ref().is_some_and(|draft| draft.id == Some(id)) { continue; }
-            }
-            let mut groups: BTreeMap<String, Vec<&Email>> = BTreeMap::new();
-            for email in &self.triage.emails {
-                if self
-                    .triage
-                    .marks
-                    .get(&email.id)
-                    .is_some_and(|m| m.action == action)
-                {
-                    groups
-                        .entry(sender_address(&email.from))
-                        .or_default()
-                        .push(email);
-                }
-            }
-            let mut groups: Vec<_> = groups.into_iter().collect();
-            groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-            let count: usize = groups.iter().map(|(_, g)| g.len()).sum();
-            let mut list = div()
-                .id(SharedString::from(match action {
-                    Action::Archive => "archive-bin".into(),
-                    Action::Trash => "trash-bin".into(),
-                    Action::Space(id) => format!("space-bin-{id}"),
-                }))
-                .flex_1()
-                .min_h_0()
-                .when(stacked, |d| d.flex_initial().flex_none().max_h(px(180.)))
-                .overflow_y_scroll();
-            for (sender, emails) in groups {
-                let ids: Vec<_> = emails.iter().map(|e| e.id.clone()).collect();
-                let unknown = ids
-                    .iter()
-                    .any(|id| matches!(self.triage.marks[id].outcome, Some(Outcome::Unknown(_))));
-                let failed = ids
-                    .iter()
-                    .any(|id| matches!(self.triage.marks[id].outcome, Some(Outcome::Failed(_))));
-                let hover_sender = sender.clone();
-                let label = format!(
-                    "{}  {}{}{}",
-                    emails.len(),
-                    sender_name(&emails[0].from),
-                    if !matches!(action, Action::Space(_)) && rule_for(&self.settings.rules, &emails[0].from).is_some() {
-                        " / RULE"
-                    } else {
-                        ""
-                    },
-                    if unknown {
-                        " / unknown"
-                    } else if failed {
-                        " / failed"
-                    } else {
-                        ""
-                    }
-                );
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("bin-{action:?}-{sender}")))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1()
-                        .on_hover(cx.listener(move |this, hovered, _, cx| {
-                            if this.resize_drag.is_some() || this.mail_drag.is_some() || this.row_menu.is_some() {
-                                return;
-                            }
-                            this.hovered = if *hovered {
-                                Some((hover_sender.clone(), action))
-                            } else {
-                                None
-                            };
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .w(px(35.))
-                                .h(px(12.))
-                                .flex_shrink_0()
-                                .flex()
-                                .gap(px(1.))
-                                .children((0..emails.len().min(9)).map(|_| {
-                                    div().w(px(3.)).h_full().bg(if action != Action::Trash {
-                                        p.accent
-                                    } else {
-                                        p.danger
-                                    })
-                                })),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(self.button(
-                            format!("peek-{action:?}-{sender}"),
-                            label,
-                            Command::Peek(sender.clone(), action),
-                            true,
-                            cx,
-                        )))
-                        .child(self.button(
-                            format!("back-{action:?}-{sender}"),
-                            "Put back",
-                            Command::PutBack(ids),
-                            !self.busy && !unknown,
-                            cx,
-                        )),
-                );
-            }
-            if action == Action::Trash && !stacked {
-                bins = bins.child(self.splitter(ResizeAxis::Bins, cx));
-            }
-            let drop_count = self.mail_drag.as_ref().map_or(0, |drag| self.triage.undecided_ids(&drag.ids).len());
-            let target_view = cx.weak_entity();
-            bins = bins.child(
-                div()
-                    .id(SharedString::from(match action {
-                        Action::Archive => "archive-drop-target".into(),
-                        Action::Trash => "trash-drop-target".into(),
-                        Action::Space(id) => format!("space-drop-target-{id}"),
-                    }))
-                    .border_1().border_color(gpui::transparent_black())
-                    .on_drag_move::<MailDrag>(cx.listener(move |this, event: &gpui::DragMoveEvent<MailDrag>, _, cx| {
-                        if event.bounds.contains(&event.event.position) {
-                            if this.drop_target != Some(action) { this.drop_target = Some(action); cx.notify(); }
-                        } else if this.drop_target == Some(action) { this.drop_target = None; cx.notify(); }
-                    }))
-                    .can_drop(move |value, _, cx| {
-                        value.downcast_ref::<MailDrag>().is_some_and(|drag| target_view.read_with(cx, |this, _| {
-                            this.can_stage_action(action) && this.sidebar_visible && !this.rules_view && !this.triage.undecided_ids(&drag.ids).is_empty()
-                        }).unwrap_or(false))
-                    })
-                    .on_drop(cx.listener(move |this, drag: &MailDrag, window, cx| {
-                        if this.can_stage_action(action) && this.sidebar_visible && !this.rules_view {
-                            this.command(Command::Stage(drag.ids.clone(), action), window, cx);
-                        }
-                        this.mail_drag = None; this.drop_target = None; cx.stop_propagation(); cx.notify();
-                    }))
-                    .when(self.can_stage_action(action) && drop_count > 0, |d| d.drag_over::<MailDrag>(move |s, _, _, _| {
-                        s.border_color(if action != Action::Trash { p.accent } else { p.danger })
-                            .bg(if action != Action::Trash { p.accent.opacity(0.1) } else { p.danger.opacity(0.1) })
-                    }))
-                    .flex_1()
-                    .map(|mut d| {
-                        d.style().flex_grow = Some(if action == Action::Archive {
-                            fraction
-                        } else {
-                            1. - fraction
-                        });
-                        d
-                    })
-                    .min_h_0()
-                    .when(stacked, |d| d.flex_initial().flex_none().min_h(px(100.)).mb_2())
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .flex_shrink_0()
-                            .border_y_1()
-                            .border_color(p.line)
-                            .text_color(if action != Action::Trash {
-                                p.accent
-                            } else {
-                                p.danger
-                            })
-                            .flex().items_center().gap_2()
-                            .child(div().flex_1().min_w_0().truncate().child(format!("TO {} / {count}", self.action_name(action).to_uppercase())))
-                            .when_some(if let Action::Space(id) = action { Some(id) } else { None }, |d, id| {
-                                d.when(self.settings.spaces.iter().any(|space| space.id == id), |d| d.child(
-                                    self.button(format!("remove-space-{id}"), "", Command::RemoveSpace(id), self.can_remove_space(id), cx)
-                                        .flex_shrink_0().flex().items_center().gap_1().text_xs().text_color(p.ink_dim)
-                                        .bg(gpui::transparent_black())
-                                        .tooltip(|_, cx| cx.new(|_| Hint("Remove this local space, not Gmail labels or messages. Apply or put back pending mail first.")).into())
-                                        .child(icons::icon("icons/x.svg", p.ink_dim)).child("Remove space")))
-                            }),
-                    )
-                    .when_some(if let Action::Space(id) = action { Some(id) } else { None }, |d, id| d.child(self.space_details(id, cx)))
-                    .child(div().px_3().py_2().text_xs().text_color(p.ink_dim).child(
-                        if self.mail_drag.is_none() { "Drop messages here".to_owned() }
-                        else if !self.can_stage_action(action) || drop_count == 0 { "Drop unavailable".into() }
-                        else if self.drop_target != Some(action) { format!("Drop {drop_count} messages here") }
-                        else if self.settings.auto_apply && !matches!(action, Action::Space(_)) { format!("Release to {} {drop_count} now", action.label().to_lowercase()) }
-                        else { format!("Release to stage {drop_count} for {}", self.action_name(action)) }
-                    ))
-                    .child(list.when(count == 0 && !stacked, |d| {
-                        d.child(div().p_4().text_color(p.ink_dim).child("Empty"))
-                    })),
-            );
-        }
-        panel = panel.child(bins);
-        let archive = self
-            .triage
-            .marks
-            .values()
-            .filter(|m| m.action == Action::Archive)
-            .count();
-        let trash = self.triage.marks.values().filter(|mark| mark.action == Action::Trash).count();
-        let spaces = self.triage.marks.len() - archive - trash;
-        panel.child(
-            div()
-                .p_3()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .border_t_1()
-                .border_color(p.line)
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(p.ink_dim)
-                        .child(if with_spaces { "Spaces add their labels and remove INBOX on Apply. Other labels and unread stay unchanged." } else { "Trash is not permanent deletion. Unread stays unchanged." }),
-                )
-                .when(self.triage.has_unknown(), |d| {
-                    d.child(self.button(
-                        "recheck",
-                        "Recheck Gmail",
-                        Command::Recheck,
-                        !self.busy && !self.blocked,
-                        cx,
-                    ))
-                })
-                .child(self.button(
-                    "apply",
-                    if spaces > 0 { format!("Apply / {} pending", archive + trash + spaces) } else { format!("Apply / {archive} Archive, {trash} Trash") },
-                    Command::Apply,
-                    !self.busy
-                        && !self.blocked
-                        && !self.triage.has_unknown()
-                        && archive + trash + spaces > 0,
-                    cx,
-                )),
-        )
     }
     fn rules(&self, cx: &Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
@@ -2124,10 +1860,12 @@ impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.reader_visible && !self.rules_view { self.ensure_reader(window, cx); }
         let below = self.reader_below();
-        let (reader_width, pane_width) = self.widths(window);
+        let (reader_width, _) = self.widths(window);
+        let reader_toggle_view = cx.weak_entity();
+        let reader_position_view = cx.weak_entity();
         let workspace_view = cx.weak_entity();
-        let list_width = f32::from(window.viewport_size().width) - reader_width - pane_width
-            - ((self.reader_visible && !below) as u8 + self.sidebar_visible as u8) as f32 * DIVIDER;
+        let list_width = f32::from(window.viewport_size().width) - reader_width
+            - (self.reader_visible && !below) as u8 as f32 * DIVIDER;
         let table_view = cx.weak_entity();
         let rows = self.triage.rows(&self.filter.read(cx).content);
         if rows.is_empty() { self.inbox_scrollbar.set(None); }
@@ -2137,12 +1875,12 @@ impl Render for MailApp {
         self.row_bounds.retain(|key, _| keys.contains(key.as_str()));
         self.label_row_anchors.retain(|key, _| keys.contains(key.as_str()));
         if self.row_menu.as_ref().is_some_and(|m| !rows.iter().any(|r| r.key == m.row.key && r.ids == m.row.ids)) {
-            self.row_menu = None; self.table_focus.focus(window);
+            self.row_menu = None; self.table_focus.focus(window, cx);
         }
         if let Some((key, _)) = self.row_focus.iter().find(|(_, f)| f.contains_focused(window, cx)) {
             if let Some(index) = rows.iter().position(|r| &r.key == key) { self.cursor = index; }
         }
-        if self.row_menu.is_none() && self.menu_focus.is_focused(window) { self.table_focus.focus(window); }
+        if self.row_menu.is_none() && self.menu_focus.is_focused(window) { self.table_focus.focus(window, cx); }
         let label_popup = if !self.rules_view && self.editing.is_none() && self.row_menu.is_none() && self.mail_drag.is_none() && self.resize_drag.is_none() {
             self.label_focus.iter().find(|(_, f)| f.is_focused(window)).and_then(|(key, _)| {
                 let row = rows.iter().find(|r| &r.key == key)?;
@@ -2163,8 +1901,11 @@ impl Render for MailApp {
         for input in [&self.space_name, &self.space_query, &self.label_query] {
             input.update(cx, |input, _| input.tab_stop = self.editing.is_none());
         }
+        let p = Palette::current(cx);
+        let header = p.header();
         self.filter.update(cx, |input, _| {
             input.tab_stop = self.editing.is_none();
+            input.palette = Some(header);
             input.placeholder = if self.rules_view {
                 "Filter sender rules..."
             } else {
@@ -2172,7 +1913,6 @@ impl Render for MailApp {
             }
             .into();
         });
-        let p = Palette::current(cx);
         let count: usize = rows.iter().filter(|r| !r.header).map(|r| r.ids.len()).sum();
         let senders = rows.iter().filter(|r| !r.child).count();
         let selected: Vec<_> = self.triage.selection.iter().cloned().collect();
@@ -2192,7 +1932,7 @@ impl Render for MailApp {
             .on_action(cx.listener(|this, _: &Apply, _, cx| this.submit(false, None, cx)))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
                 if this.editing.is_none() {
-                    this.filter.read(cx).focus_handle.focus(window);
+                    this.filter.read(cx).focus_handle.clone().focus(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleRules, window, cx| {
@@ -2208,9 +1948,9 @@ impl Render for MailApp {
                 if event.keystroke.key == "tab" {
                     cx.stop_propagation();
                     if event.keystroke.modifiers.shift {
-                        window.focus_prev();
+                        window.focus_prev(cx);
                     } else {
-                        window.focus_next();
+                        window.focus_next(cx);
                     }
                     cx.notify();
                 }
@@ -2219,15 +1959,15 @@ impl Render for MailApp {
                     this.mail_drag = None; this.drop_target = None;
                     this.inbox_scroll_drag = None;
                     if this.label_removal.take().is_some() {
-                        this.table_focus.focus(window); cx.stop_propagation(); cx.notify(); return;
+                        this.table_focus.focus(window, cx); cx.stop_propagation(); cx.notify(); return;
                     }
                     if this.label_picker.take().is_some() {
                         this.label_row_targets = None;
-                        this.table_focus.focus(window); cx.stop_propagation(); cx.notify(); return;
+                        this.table_focus.focus(window, cx); cx.stop_propagation(); cx.notify(); return;
                     }
                     if this.space_draft.as_ref().is_some_and(|draft| draft.picker) {
                         this.space_draft.as_mut().unwrap().picker = false;
-                        this.space_name.read(cx).focus_handle.focus(window);
+                        this.space_name.read(cx).focus_handle.clone().focus(window, cx);
                         cx.stop_propagation(); cx.notify(); return;
                     }
                     if this.row_menu.is_some() { this.close_row_menu(window, cx); cx.stop_propagation(); return; }
@@ -2235,7 +1975,7 @@ impl Render for MailApp {
                     this.editing = None;
                     this.peek = None;
                     this.hovered = None;
-                    this.table_focus.focus(window);
+                    this.table_focus.focus(window, cx);
                     cx.notify();
                 }
             }))
@@ -2248,24 +1988,25 @@ impl Render for MailApp {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(p.line)
-                    .bg(p.panel)
+                    .border_color(header.line)
+                    .bg(header.canvas)
+                    .text_color(header.ink)
                     .child(div().w(px(190.)).child(self.filter.clone()))
-                    .child(self.button(
+                    .child(self.header_button(
                         "query",
                         "Run query",
                         Command::Refresh(true),
                         !self.busy && !self.settings.rules.is_empty(),
                         cx,
                     ))
-                    .child(self.button(
+                    .child(self.header_button(
                         "rules",
                         if self.rules_view { "Inbox" } else { "Rules" },
                         Command::Rules,
                         true,
                         cx,
                     ))
-                    .child(self.button(
+                    .child(self.header_button(
                         "refresh",
                         if self.busy {
                             "Working..."
@@ -2280,34 +2021,34 @@ impl Render for MailApp {
                     ))
                     .child(
                         div()
-                            .text_color(p.ink_dim)
+                            .text_color(header.ink_dim)
                             .child(format!("{senders} senders / {count} undecided")),
                     )
                     .when(!selected.is_empty() && !self.rules_view, |d| {
                         d.child(
                             div()
-                                .text_color(p.accent)
+                                .text_color(header.accent)
                                 .child(format!("{} checked", selected.len())),
                         )
-                        .child(self.button("assign-labels", "Add label", Command::TopLabelPicker(LabelMode::Assign), can_stage && (self.demo || self.session.is_some()), cx)
-                            .flex().items_center().gap_1().child(icons::icon("icons/label.svg", p.ink_dim))
+                        .child(self.header_button("assign-labels", "Add label", Command::TopLabelPicker(LabelMode::Assign), can_stage && (self.demo || self.session.is_some()), cx)
+                            .flex().items_center().gap_1().child(icons::icon("icons/label.svg", header.ink_dim))
                             .relative().child(self.label_trigger_anchor(LabelMode::Assign, None, cx))
                             .tooltip(|_, cx| cx.new(|_| Hint("Add a label to checked messages now. Keeps INBOX.")).into()))
-                        .child(self.button(
+                        .child(self.header_button(
                             "selection-a",
                             format!("Archive {}", selected.len()),
                             Command::Stage(selected.clone(), Action::Archive),
                             can_stage,
                             cx,
                         ))
-                        .child(self.button(
+                        .child(self.header_button(
                             "selection-d",
                             format!("Trash {}", selected.len()),
                             Command::Stage(selected.clone(), Action::Trash),
                             can_stage,
                             cx,
                         ))
-                        .child(self.button(
+                        .child(self.header_button(
                             "clear",
                             "Clear",
                             Command::Clear,
@@ -2316,7 +2057,11 @@ impl Render for MailApp {
                         ))
                     })
                     .child(div().flex_1())
-                    .child(self.button(
+                    .child(self.header_button("toggle-reader", if self.reader_visible { "Hide reader" } else { "Show reader" }, Command::ToggleReader, !self.rules_view, cx).w(px(112.)).relative()
+                        .child(canvas(move |bounds, _, cx| { let _ = reader_toggle_view.update(cx, |app, _| app.reader_toggle_bounds = bounds); }, |_, _, _, _| {}).absolute().inset_0()))
+                    .child(self.header_button("toggle-reader-position", "", Command::ToggleReaderPosition, !self.rules_view && !self.blocked, cx).relative()
+                        .child(canvas(move |bounds, _, cx| { let _ = reader_position_view.update(cx, |app, _| app.reader_position_bounds = bounds); }, |_, _, _, _| {}).absolute().inset_0()))
+                    .child(self.header_button(
                         "auto",
                         if self.settings.auto_apply {
                             "Auto-apply ON"
@@ -2327,7 +2072,7 @@ impl Render for MailApp {
                         !self.busy && !self.blocked,
                         cx,
                     ))
-                    .child(self.button(
+                    .child(self.header_button(
                         "theme",
                         format!("Theme: {}", self.settings.theme),
                         Command::Theme,
@@ -2347,11 +2092,15 @@ impl Render for MailApp {
                         format!("{} Label metadata is unavailable; cached labels are kept. Refresh to retry.", self.status)
                     } else { self.status.clone() })),
             )
+            .when_some(self.color_reload_error.as_ref(), |d, error| d.child(
+                div().px_3().py_1().text_color(p.danger)
+                    .child(format!("Colors not reloaded: {error}. Keeping the last valid colors; save a valid file to retry.")),
+            ))
             .when(!self.rules_view, |d| d.child(self.label_filter_controls(cx)));
         root = if self.rules_view {
             root.child(self.rules(cx))
         } else {
-            root.child(div().flex().flex_1().min_h_0().relative()
+            root.child(div().flex().flex_col().flex_1().min_h_0().relative()
                 .child(canvas(move |bounds, _, cx| {
                     cx.defer(move |cx| {
                         let _ = workspace_view.update(cx, |this, cx| {
@@ -2376,7 +2125,7 @@ impl Render for MailApp {
                         .when(rows.is_empty(), |d| d.child(div().absolute().inset_0().p_8().text_color(p.ink_dim).child(if self.filter.read(cx).content.is_empty() && self.triage.label_filter.is_empty() {"Nothing left undecided in the loaded Inbox."} else {"No messages match these filters."})))
                         .child(uniform_list("inbox",rows.len(),cx.processor(move |this,range:std::ops::Range<usize>,window,cx|range.map(|i|
                             this.row(rows[i].clone(),i,list_width - SCROLLBAR_WIDTH,window,cx).into_any_element()
-                        ).collect())).track_scroll(self.scroll.clone()).mr(px(SCROLLBAR_WIDTH)).flex_1().min_h_0())
+                        ).collect())).track_scroll(&self.scroll).mr(px(SCROLLBAR_WIDTH)).flex_1().min_h_0())
                         .child(self.inbox_scrollbar(cx))))
                 .when(self.reader_visible, |d| {
                     let reader = self.reader.clone().expect("Visible reader is initialized");
@@ -2394,15 +2143,9 @@ impl Render for MailApp {
                             .child(div().px_3().py_1().text_xs().text_color(p.ink_dim).child(status))
                             .child(div().flex_1().min_h_0().child(reader)))
                 }))
-                .when(self.sidebar_visible, |d| d.child(self.splitter(ResizeAxis::Width, cx)).child(self.bins(pane_width, cx))))
+                .when(self.sidebar_visible, |d| d.child(self.staging_review(cx))))
         };
-        root = root.child(div().h(px(34.)).flex_shrink_0().flex().items_center().gap_2().px_3()
-            .border_t_1().border_color(p.line).bg(p.panel).text_xs().text_color(p.ink_dim)
-            .child(div().flex_1().min_w_0().truncate().child("Row: read / expand   Checkbox: select   Middle-click: all / none   Right-click / Shift+F10: menu   Drag: stage"))
-            .child(format!("{} pending", self.triage.marks.len()))
-            .child(self.button("toggle-reader-position", "", Command::ToggleReaderPosition, !self.rules_view && !self.blocked, cx))
-            .child(self.button("toggle-reader", "", Command::ToggleReader, !self.rules_view, cx))
-            .child(self.button("toggle-staging", "", Command::ToggleSidebar, !self.rules_view, cx)));
+        root = root.child(self.staging_line(cx));
         if self.sidebar_visible && !self.rules_view
             && let Some((sender, action)) = self.peek.as_ref().or(self.hovered.as_ref())
         {
@@ -2423,8 +2166,8 @@ impl Render for MailApp {
                 root = root.child(
                     div()
                         .absolute()
-                        .right(px(pane_width + DIVIDER + 8.))
-                        .top(px(150.))
+                        .right(px(16.))
+                        .bottom(px(56.))
                         .w(px(370.))
                         .max_h(px(420.))
                         .p_3()
@@ -2524,7 +2267,7 @@ impl Render for MailApp {
         );
         if let Some(drag) = self.resize_drag {
             root = root.child(div().absolute().inset_0().occlude().cursor(
-                if matches!(drag.axis, ResizeAxis::Width | ResizeAxis::Reader) {
+                if drag.axis == ResizeAxis::Reader {
                     CursorStyle::ResizeLeftRight
                 } else {
                     CursorStyle::ResizeUpDown
@@ -2560,7 +2303,7 @@ impl Render for MailApp {
             root = root.child(div().absolute().inset_0().occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| { cx.stop_propagation(); this.close_row_menu(window, cx); }))
                 .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| { cx.stop_propagation(); this.close_row_menu(window, cx); }))
-                .on_scroll_wheel(cx.listener(|this, _, window, cx| { cx.stop_propagation(); this.close_row_menu(window, cx); }))
+                .on_scroll(cx.listener(|this, _, window, cx| { cx.stop_propagation(); this.close_row_menu(window, cx); }))
                 .child(div().id("row-menu").track_focus(&self.menu_focus).absolute().left(position.x).top(position.y)
                     .w(px(360.)).h(px(252.)).bg(p.panel).text_color(p.ink).border_1().border_color(p.accent)
                     .child(canvas(move |bounds, _, cx| { let _ = menu_view.update(cx, |this, _| this.menu_bounds = bounds); }, |_, _, _, _| {}).absolute().inset_0())
@@ -2667,10 +2410,10 @@ impl Render for MailApp {
     }
 }
 fn main() {
-    // ponytail: GPUI 0.2.2 composes above child HWNDs; keep its DirectX HWND path until upstream supports child-safe composition.
+    // GPUI's DirectComposition target covers child HWNDs; retain the child-safe DirectX HWND path.
     // SAFETY: Set startup configuration before GPUI, WebView2, or workers initialize.
     unsafe { std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1") };
-    Application::new()
+    gpui_platform::application()
         .with_assets(icons::Assets)
         .run(|cx: &mut App| {
             cx.set_global(Palette::default());
@@ -2684,7 +2427,7 @@ fn main() {
                 KeyBinding::new("ctrl-shift-b", ToggleStaging, Some("MailApp")),
                 KeyBinding::new("alt-r", ToggleReader, Some("MailApp")),
             ]);
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
                 }
@@ -2698,7 +2441,8 @@ fn main() {
                 cx.activate(true);
                 return;
             }
-            let check = std::env::args().any(|a| a == "--triage-check");
+            let check_colors = std::env::args().any(|a| a == "--color-check");
+            let check = check_colors || std::env::args().any(|a| a == "--triage-check");
             let demo = check || std::env::args().any(|a| a == "--demo");
             let bounds = Bounds::centered(None, size(px(1480.), px(850.)), cx);
             cx.open_window(
@@ -2722,10 +2466,13 @@ fn main() {
                     cx.new(|cx| {
                         let mut app = MailApp::new(window, cx, demo);
                         if !demo {
+                            if !app.blocked { app.watch_colors(cx); }
                             app.load(false, false, cx);
                         }
                         if check {
-                            if std::env::args().any(|arg| arg == "--detach-only") {
+                            if check_colors {
+                                color_check::start(window.window_handle(), cx);
+                            } else if std::env::args().any(|arg| arg == "--detach-only") {
                                 reader::detach_check::start(window.window_handle(), cx);
                             } else {
                                 triage_check::start(window.window_handle(), cx);
@@ -2809,25 +2556,17 @@ mod layout_tests {
         }
     }
     #[test]
-    fn sidebar_limits_keep_inbox_and_both_bins_usable() {
-        assert_eq!(pane_widths(1480., None, Some(320.)), (0., 320.));
-        assert_eq!(pane_widths(1480., Some(480.), Some(320.)), (480., 320.));
-        assert_eq!(pane_widths(1100., None, None), (0., 0.));
-        assert_eq!(pane_widths(1100., Some(10.), None), (320., 0.));
+    fn split_reader_reserves_list_width_without_a_third_column() {
+        assert_eq!(pane_widths(1480., None), (0., 0.));
+        assert_eq!(pane_widths(1480., Some(480.)), (480., 0.));
+        assert_eq!(pane_widths(1100., Some(10.)), (320., 0.));
         for viewport in [1100., 1480., 1920.] {
             for reader in [None, Some(480.), Some(8000.)] {
-                for staging in [None, Some(320.), Some(8000.)] {
-                    let (r, s) = pane_widths(viewport, reader, staging);
-                    let dividers = (reader.is_some() as u8 + staging.is_some() as u8) as f32 * DIVIDER;
-                    assert!(r + s + dividers <= viewport - 420. + 0.01);
-                    assert!(reader.is_none() || r >= 320.);
-                    assert!(staging.is_none() || s >= 260.);
-                }
+                let (width, staging) = pane_widths(viewport, reader);
+                assert_eq!(staging, 0.);
+                assert!(width + reader.is_some() as u8 as f32 * DIVIDER <= viewport - 420.);
+                assert!(reader.is_none() || width >= 320.);
             }
         }
-        assert_eq!(clamp_archive_fraction(-1., 320.), 0.25);
-        assert_eq!(clamp_archive_fraction(2., 320.), 0.75);
-        assert_eq!(clamp_archive_fraction(0.3, 0.), 0.5);
-        assert_eq!(clamp_archive_fraction(0.8, 120.), 0.5);
     }
 }

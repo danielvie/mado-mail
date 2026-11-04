@@ -78,10 +78,10 @@ fn restrict(
             let view = focus_view.clone();
             focus_cx.spawn(async move |cx| {
                 let _ = host.update(cx, |_, window, cx| {
-                    let _ = view.update(cx, |this, _| {
+                    let _ = view.update(cx, |this, cx| {
                         if this.visible && windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
                             != windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow()
-                        { this.body_focus.focus(window); }
+                        { this.body_focus.focus(window, cx); }
                     });
                 });
             }).detach();
@@ -100,8 +100,8 @@ fn restrict(
                     let _ = view.update(cx, |this, _| {
                         if let Some(webview) = &this.webview { let _ = webview.focus_parent(); }
                     });
-                    if reason == COREWEBVIEW2_MOVE_FOCUS_REASON_NEXT { window.focus_next(); }
-                    else { window.focus_prev(); }
+                    if reason == COREWEBVIEW2_MOVE_FOCUS_REASON_NEXT { window.focus_next(cx); }
+                    else { window.focus_prev(cx); }
                 });
             }).detach();
             Ok(())
@@ -180,7 +180,7 @@ fn restrict(
                 args.IsUserInitiated(&mut user)?;
                 if user.as_bool() && message::external_link(&uri) {
                     cx.spawn(async move |cx| {
-                        let _ = cx.update(|cx| cx.open_url(&uri));
+                        cx.update(|cx| cx.open_url(&uri));
                     })
                     .detach();
                 }
@@ -270,7 +270,7 @@ impl Reader {
                 cx.new(|cx| {
                     let mut reader = Self::new(window, cx);
                     reader.detachable = false;
-                    reader.focus.focus(window);
+                    reader.focus.focus(window, cx);
                     reader
                 })
             },
@@ -594,10 +594,10 @@ impl Render for Reader {
             .when(!self.detachable, |d| d.on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "tab" {
                     cx.stop_propagation();
-                    if event.keystroke.modifiers.shift { window.focus_prev(); } else { window.focus_next(); }
+                    if event.keystroke.modifiers.shift { window.focus_prev(cx); } else { window.focus_next(cx); }
                 } else if event.keystroke.key == "escape" {
                     this.focus_host();
-                    this.focus.focus(window);
+                    this.focus.focus(window, cx);
                     cx.stop_propagation();
                 }
             })))

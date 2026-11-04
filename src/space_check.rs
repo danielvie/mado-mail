@@ -7,10 +7,11 @@ pub(super) async fn check_spaces(window: AnyWindowHandle, this: &gpui::WeakEntit
         app.triage.marks.clear();
         app.triage.emails.truncate(3);
         app.triage.expanded.insert("studio.updates@example.test".into());
-        app.sidebar_width = 420.;
+        ensure!(!app.sidebar_visible && !app.reader_visible, "Synthetic space check must start with reader and review collapsed");
         app.settings.auto_apply = true;
         app.command(Command::NewSpace, window, cx);
         ensure!(app.space_draft.is_some() && app.editing.is_none() && app.settings.spaces.is_empty(), "New space did not create an inline draft");
+        ensure!(app.sidebar_visible && app.settings.staging_review_open && !app.reader_visible, "New space did not open review independently of the reader");
         app.command(Command::SaveSpace, window, cx);
         ensure!(app.settings.spaces.is_empty(), "An empty draft was saved");
         app.space_name.update(cx, |input, cx| input.set("Work", cx));
@@ -39,6 +40,8 @@ pub(super) async fn check_spaces(window: AnyWindowHandle, this: &gpui::WeakEntit
         app.command(Command::NewSpace, window, cx);
         app.command(Command::CancelSpace, window, cx);
         ensure!(app.space_draft.is_none() && app.settings.spaces.len() == 1, "Cancel removed a saved space");
+        app.command(Command::ToggleSidebar, window, cx);
+        ensure!(!app.sidebar_visible && !app.settings.staging_review_open && !app.reader_visible, "Space review failed to collapse independently");
         app.triage.selection = ["demo-0".into(), "demo-1".into()].into_iter().collect();
         cx.notify();
         Ok(app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>())
@@ -73,7 +76,8 @@ pub(super) async fn check_spaces(window: AnyWindowHandle, this: &gpui::WeakEntit
     })??;
     window.update(cx, |root, window, cx| {
         let entity = root.downcast::<MailApp>().unwrap(); let app = entity.read(cx);
-        let to = point(app.bin_bounds.left() + px(90.), app.bin_bounds.top() + px(244.));
+        check_staging_geometry(app, window)?;
+        let to = staging_drop_position(app, Action::Space(1))?;
         mouse(window, WM_MOUSEMOVE, 1, to)?;
         mouse(window, WM_LBUTTONUP, 0, to)
     })??;
@@ -81,6 +85,8 @@ pub(super) async fn check_spaces(window: AnyWindowHandle, this: &gpui::WeakEntit
     this.update(cx, |app, _| {
         ensure!(app.triage.marks.len() == 2 && app.triage.marks.values().all(|mark| mark.action == Action::Space(1)), "Drag did not stage the selected batch in Work: {:?}", app.triage.work());
         ensure!(app.triage.selection.is_empty(), "Drop did not clear moved checkmarks");
+        ensure!(!app.sidebar_visible && !app.settings.staging_review_open && !app.reader_visible
+            && app.staging_counts() == (2, 0, 0) && app.staging_can_apply(), "Collapsed space drop opened a pane or made pending work inaccessible");
         ensure!(app.triage.emails.iter().map(|email| (email.id.clone(), email.label_ids.clone())).collect::<Vec<_>>() == original, "Space drop wrote immediately or changed labels"); Ok(())
     })??;
     capture("space-pending.png", cx).await?;
@@ -100,18 +106,26 @@ pub(super) async fn check_spaces(window: AnyWindowHandle, this: &gpui::WeakEntit
         app.command(Command::Stage(vec!["demo-1".into()], Action::Space(1)), window, cx);
         app.command(Command::Apply, window, cx);
         ensure!(app.triage.marks.is_empty() && app.triage.emails.len() == 1 && app.triage.emails[0].id == "demo-2", "Apply did not remove only the staged emails");
+        ensure!(app.triage.emails[0].label_ids == original.iter().find(|(id, _)| id == "demo-2").unwrap().1, "Space Apply changed the remaining message's labels");
         ensure!(app.settings.spaces.len() == 1, "Apply removed the reusable space");
         ensure!(app.demo && app.session.is_none(), "Check reached Gmail");
         window.resize(gpui::size(px(1100.), px(600.)));
         app.command(Command::EditSpace(1), window, cx);
+        ensure!(app.sidebar_visible && app.settings.staging_review_open && !app.reader_visible, "Edit space did not reopen review independently");
         Ok(())
     }))??;
     cx.background_executor().timer(Duration::from_millis(300)).await;
     window.update(cx, |root, window, cx| {
         let entity = root.downcast::<MailApp>().unwrap(); let app = entity.read(cx);
         ensure!(app.space_draft.is_some() && app.space_query.read(cx).focus_handle.is_focused(window), "Editing did not focus the inline finder");
-        ensure!(app.bin_bounds.right() <= window.viewport_size().width && app.bin_bounds.size.height > px(100.), "Small-window staging overflowed");
+        check_staging_geometry(app, window)?;
+        ensure!(app.bin_bounds.size.height > px(100.), "Small-window review has no usable editor height");
         Ok(())
+    })??;
+    this.update(cx, |app, cx| { app.staging_scroll.scroll_to_bottom(); cx.notify(); })?;
+    cx.background_executor().timer(Duration::from_millis(200)).await;
+    this.update(cx, |app, _| {
+        ensure!(app.staging_scroll.offset().y < px(0.) && app.space_draft.is_some(), "Shallow review cannot scroll to the space editor's remaining controls"); Ok(())
     })??;
     capture("space-small-window.png", cx).await?;
     Ok(())
