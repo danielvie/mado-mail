@@ -2,7 +2,9 @@ use gpui::{AssetSource, Hsla, SharedString, div, prelude::*, px, svg};
 use std::borrow::Cow;
 
 // Embed assets so installed builds do not depend on the source checkout or current directory.
-const ICONS: [(&str, &[u8]); 15] = [
+const ICONS: [(&str, &[u8]); 17] = [
+    ("icons/window-maximize.svg", include_bytes!("../assets/icons/window-maximize.svg")),
+    ("icons/window-restore.svg", include_bytes!("../assets/icons/window-restore.svg")),
     ("icons/label.svg", include_bytes!("../assets/icons/label.svg")),
     (
         "icons/x.svg",
@@ -113,7 +115,7 @@ mod tests {
         for path in Assets.list("icons/").unwrap() {
             assert!(Assets.load(&path).unwrap().is_some());
         }
-        assert_eq!(Assets.list("icons/").unwrap().len(), 15);
+        assert_eq!(Assets.list("icons/").unwrap().len(), 17);
         assert!(Assets.load("../settings.json").unwrap().is_none());
     }
 }

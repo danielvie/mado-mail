@@ -378,7 +378,7 @@ async fn check_reader_visibility(window: AnyWindowHandle, this: &gpui::WeakEntit
         ensure!(!app.reader_visible && !app.sidebar_visible && !app.settings.staging_review_open, "Synthetic reader/review defaults are not collapsed");
         check_staging_geometry(app, window)?;
         // The measurement canvas excludes the button's two physical-pixel borders.
-        ensure!((f32::from(app.reader_toggle_bounds.size.width) + 2. / window.scale_factor() - 112.).abs() < 1.
+        ensure!((f32::from(app.reader_toggle_bounds.size.width) + 2. / window.scale_factor() - 28.).abs() < 1.
             && app.reader_position_bounds.left() >= app.reader_toggle_bounds.right(), "Reader controls are not adjacent in the top toolbar: toggle {:?}, placement {:?}", app.reader_toggle_bounds, app.reader_position_bounds);
         Ok((app.settings.clone(), app.triage.work(), app.triage.emails.iter().map(|email| email.label_ids.clone()).collect::<Vec<_>>(), app.reader_toggle_bounds))
     })??;
@@ -695,7 +695,8 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                     && this.triage.selection.len() == 12, "Trash icon did not preserve row-local action scope");
                 this.triage.unmark(std::slice::from_ref(id)); cx.notify(); Ok(())
             })??;
-            browser.evaluate_script("window.scrollTo(0,document.body.scrollHeight)")?;
+            // Stay below the scroll limit in both wrapped and single-row header layouts.
+            browser.evaluate_script("window.scrollTo(0,80)")?;
             let scrolled = crate::reader_check::probe(&browser).await?;
             ensure!(scrolled["scroll"].as_f64().unwrap_or_default() > 0., "Embedded body does not scroll");
             // Context menu sources agree; an unchecked group's actions stay row-local.
@@ -850,7 +851,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
-            ensure!(!visible(&browser)?, "Top Hide reader button left its native child visible");
+            ensure!(!visible(&browser)?, "Top reader toggle left its native child visible");
             window.update(cx, |root, window, cx| {
                 let view = root.downcast::<MailApp>().unwrap();
                 ensure!(view.read(cx).table_focus.is_focused(window), "Hide did not return logical focus to the list");
@@ -1077,7 +1078,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                         window.focus_next(cx);
                         window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
                     } else {
-                        let pos = point(px(188.), px(24.));
+                        let pos = point(px(270.), px(26.));
                         drag(window, pos, pos, pos)?;
                     }
                     anyhow::Ok(())
@@ -1101,7 +1102,7 @@ pub fn start(window: AnyWindowHandle, cx: &mut Context<MailApp>) {
                 filter.read(cx).focus_handle.clone().focus(window, cx);
                 window.focus_next(cx);
                 ensure!(!filter.read(cx).focus_handle.contains_focused(window, cx), "Empty filter retained a clear-button tab stop");
-                let pos = point(px(188.), px(24.)); drag(window, pos, pos, pos)
+                let pos = point(px(270.), px(26.)); drag(window, pos, pos, pos)
             })??;
             cx.background_executor().timer(Duration::from_millis(150)).await;
             window.update(cx, |_, window, cx| window.dispatch_keystroke(Keystroke::parse("x").unwrap(), cx))?;

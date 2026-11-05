@@ -23,7 +23,7 @@ use gpui::{
     App, Bounds, Context, CursorStyle, DispatchPhase, Entity, FocusHandle, KeyBinding,
     MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptLevel,
     ScrollStrategy, SharedString, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions, actions, canvas, div, prelude::*, px, size, uniform_list,
+    WindowControlArea, WindowOptions, actions, canvas, div, prelude::*, px, size, uniform_list,
 };
 use input::TextInput;
 use label_ui::LabelMode;
@@ -1168,6 +1168,48 @@ impl MailApp {
         }
         cx.notify();
     }
+    fn window_controls(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
+        let p = Palette::current(cx).header();
+        let maximized = window.is_maximized();
+        div().flex().flex_shrink_0().self_start().w(px(138.)).children([
+            ("window-minimize", "Minimize", "icons/minus.svg", WindowControlArea::Min),
+            ("window-maximize", if maximized { "Restore" } else { "Maximize" },
+                if maximized { "icons/window-restore.svg" } else { "icons/window-maximize.svg" }, WindowControlArea::Max),
+            ("window-close", "Close", "icons/x.svg", WindowControlArea::Close),
+        ].into_iter().map(|(id, label, icon, area)| {
+            div().id(id).tab_index(0).tab_stop(self.editing.is_none()).flex_shrink_0().w(px(46.)).h(px(52.))
+                .window_control_area(area).flex().items_center().justify_center()
+                .text_color(p.ink_dim)
+                .hover(move |s| s.bg(if area == WindowControlArea::Close { gpui::rgb(0xc42b1c).into() } else { p.panel2 })
+                    .text_color(gpui::white()))
+                .focus_visible(|s| s.border_1().border_color(p.accent))
+                .tooltip(move |_, cx| cx.new(|_| Hint(label)).into())
+                // Pointer actions use GPUI's native caption handling, including Windows Snap.
+                .on_key_down(move |event, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        use windows::Win32::{Foundation::{HWND, LPARAM, WPARAM}, UI::WindowsAndMessaging::{
+                            PostMessageW, WM_SYSCOMMAND, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE, SC_CLOSE,
+                        }};
+                        cx.stop_propagation();
+                        let command = match area {
+                            WindowControlArea::Min => SC_MINIMIZE,
+                            WindowControlArea::Max if window.is_maximized() => SC_RESTORE,
+                            WindowControlArea::Max => SC_MAXIMIZE,
+                            WindowControlArea::Close => SC_CLOSE,
+                            WindowControlArea::Drag => unreachable!(),
+                        };
+                        if let Ok(handle) = HasWindowHandle::window_handle(window)
+                            && let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                            // Queue the same system command as a native caption button.
+                            let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+                            let _ = unsafe { PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(command as usize), LPARAM(0)) };
+                        }
+                    }
+                })
+                .child(icons::icon(icon, p.ink_dim))
+        }))
+    }
     fn header_button(
         &self,
         id: impl Into<SharedString>,
@@ -1980,17 +2022,18 @@ impl Render for MailApp {
                 }
             }))
             .child(
-                div()
+                div().flex().flex_shrink_0().border_b_1().border_color(header.line)
+                    .bg(header.canvas).text_color(header.ink)
+                    .child(div()
+                    .flex_1().min_w_0()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap_2()
                     .px_3()
                     .py_2()
-                    .border_b_1()
-                    .border_color(header.line)
-                    .bg(header.canvas)
-                    .text_color(header.ink)
+                    .child(div().id("window-drag-brand").window_control_area(WindowControlArea::Drag)
+                        .h(px(36.)).px_2().flex().items_center().child("Mado Mail"))
                     .child(div().w(px(190.)).child(self.filter.clone()))
                     .child(self.header_button(
                         "query",
@@ -2056,8 +2099,9 @@ impl Render for MailApp {
                             cx,
                         ))
                     })
-                    .child(div().flex_1())
-                    .child(self.header_button("toggle-reader", if self.reader_visible { "Hide reader" } else { "Show reader" }, Command::ToggleReader, !self.rules_view, cx).w(px(112.)).relative()
+                    .child(div().id("window-drag-space").flex_1().min_w(px(32.)).h(px(36.))
+                        .window_control_area(WindowControlArea::Drag))
+                    .child(self.header_button("toggle-reader", "", Command::ToggleReader, !self.rules_view, cx).relative()
                         .child(canvas(move |bounds, _, cx| { let _ = reader_toggle_view.update(cx, |app, _| app.reader_toggle_bounds = bounds); }, |_, _, _, _| {}).absolute().inset_0()))
                     .child(self.header_button("toggle-reader-position", "", Command::ToggleReaderPosition, !self.rules_view && !self.blocked, cx).relative()
                         .child(canvas(move |bounds, _, cx| { let _ = reader_position_view.update(cx, |app, _| app.reader_position_bounds = bounds); }, |_, _, _, _| {}).absolute().inset_0()))
@@ -2078,7 +2122,8 @@ impl Render for MailApp {
                         Command::Theme,
                         !self.busy && !self.blocked && self.settings.theme_names().len() > 1,
                         cx,
-                    )),
+                    )))
+                    .child(self.window_controls(window, cx)),
             )
             .child(
                 div()
@@ -2450,6 +2495,8 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(1100.), px(600.))),
                     titlebar: Some(TitlebarOptions {
+                        // https://docs.rs/gpui-pre/0.3.11/gpui/struct.TitlebarOptions.html
+                        appears_transparent: true,
                         title: Some(
                             if demo {
                                 "Mado Mail - Demo"
