@@ -75,7 +75,7 @@ impl Credentials {
 
 fn credential_entry(user: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(CREDENTIAL_SERVICE, user)
-        .context("Could not open Windows Credential Manager")
+        .context("Could not open the operating system credential store (Keychain on macOS, Credential Manager on Windows)")
 }
 
 fn http_client() -> Result<Client> {
@@ -412,7 +412,7 @@ impl Session {
         if let Some(refresh_token) = token.refresh_token() {
             credential_entry(&self.credential_user)?
                 .set_password(refresh_token.secret())
-                .context("Could not save Google authorization in Windows Credential Manager")?;
+                .context("Could not save Google authorization in the operating system credential store")?;
             self.refresh_token = refresh_token.clone();
         }
         self.token = token.access_token().secret().clone();

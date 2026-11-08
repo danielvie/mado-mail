@@ -1,6 +1,6 @@
 # Mado Mail GPUI application
 
-Windows Gmail triage app built with Rust and GPUI. The repository root is a single Rust crate named `mado-mail`, with application code in `src/`.
+Windows and macOS Gmail triage app built with Rust and GPUI. The repository root is a single Rust crate named `mado-mail`, with application code in `src/`.
 
 ## Run
 
@@ -9,18 +9,23 @@ task run           # Build and launch with Gmail
 task demo          # Synthetic Inbox; no credentials, network, or settings writes
 task check         # All Rust targets with locked dependencies
 task test          # Model, settings, OAuth, MIME, and synthetic HTTP tests
-task build         # target/release/mado-mail.exe
-task install       # Build release and copy mado-mail.exe to ~/.local/bin
+task build         # target/release/mado-mail on macOS, mado-mail.exe on Windows
+task install       # Build release and copy the native executable to ~/.local/bin
+task reader-check  # macOS only: isolated offline reader/security checks
 task clean         # Rust build artifacts only
 ```
 
-Requires stable Rust, Visual Studio C++ build tools with a Windows SDK, and Microsoft Edge WebView2 Runtime. Without Task, use `cargo run --release`.
+Requires current stable Rust. Windows also needs Visual Studio C++ build tools with a Windows SDK and Microsoft Edge WebView2 Runtime. macOS needs Xcode Command Line Tools and Python 3 for the native check; WKWebView ships with macOS. macOS uses GPUI runtime shaders rather than a separate build-time Metal toolchain. Without Task, use `cargo run --release --locked`.
 
 Windows builds embed `build/icon.ico` for the executable, taskbar, and native windows. No separate icon file is needed at runtime.
 
 ## Native UI checks
 
-Run the scripts directly after building:
+On macOS, run `task reader-check` for sanitized body loading, embedded images, blocked/allowed/reblocked synthetic images, independent native filtering, navigation cancellation, pane visibility, resizing, synthetic native key routing, Command editing, and detached-reader lifecycle. The report is `target/macos-reader-check.json`. This uses a synthetic-only custom-scheme image, not a live HTTPS server. Physical keyboard traversal, visual alignment, and native controls still need manual checks.
+
+For isolated macOS startup checks, run `uv run --no-project python scripts/check-macos-startup.py run` and `uv run --no-project python scripts/check-macos-startup.py demo`. These use a temporary HOME and stop only their own process groups after observing an app window.
+
+On Windows, run the scripts directly after building:
 
 ```text
 task build
@@ -38,17 +43,17 @@ For color hot reload, `cargo build` followed by `powershell.exe -NoProfile -File
 ## Gmail connection
 
 1. Enable Gmail API in your Google Cloud project and create a Desktop app OAuth client.
-2. Save its downloaded JSON at `%USERPROFILE%\.mado\mado-mail\client_secret.json`.
+2. Save its downloaded JSON at `~/.mado/mado-mail/client_secret.json` on macOS or `%USERPROFILE%\.mado\mado-mail\client_secret.json` on Windows.
 3. Add your account as a test user if the Google consent app is in Testing.
 4. Run the app and choose Connect Gmail.
 
-The app now requests `gmail.modify` for Archive, Trash, and read/unread actions. This requires fresh sign-in even if an earlier read-only build was authorized. Refresh tokens live in Windows Credential Manager under `mado-mail/gmail.modify`, scoped to the OAuth client. The old `mado-mail-poc/gmail.readonly` entry and Electron `token.json` are untouched. Access tokens remain in memory. Transient network errors retain authorization; revoked grants require reconnection. Google Testing-mode grants can expire after seven days.
+The app now requests `gmail.modify` for Archive, Trash, and read/unread actions. This requires fresh sign-in even if an earlier read-only build was authorized. Refresh tokens live in macOS Keychain or Windows Credential Manager under `mado-mail/gmail.modify`, scoped to the OAuth client. The old `mado-mail-poc/gmail.readonly` entry and Electron `token.json` are untouched. Access tokens remain in memory. Transient network errors retain authorization; revoked grants require reconnection. Google Testing-mode grants can expire after seven days.
 
-To forget authorization, close the app and remove only its `mado-mail/gmail.modify` Generic Credential in Windows Credential Manager.
+To forget authorization, close the app and remove only its `mado-mail/gmail.modify` entry from Keychain Access on macOS or its Generic Credential from Windows Credential Manager.
 
 ## Triage
 
-The main window combines its title bar and toolbar in one themed header. Drag the app name or empty space to move the window; double-click either to maximize or restore. Native caption hit regions preserve Windows Snap and resizing. Minimize, maximize/restore, and close stay at the right edge when the toolbar wraps in smaller windows. Tab reaches these buttons outside the sender-rule dialog; Enter or Space activates them. Separate message-reader windows keep their standard title bars.
+On macOS, the main window uses the standard native title bar and window controls. On Windows, the main window combines its title bar and toolbar in one themed header. Drag the app name or empty space to move the window; double-click either to maximize or restore. Native caption hit regions preserve Windows Snap and resizing. Minimize, maximize/restore, and close stay at the right edge when the toolbar wraps in smaller windows. Tab reaches these buttons outside the sender-rule dialog; Enter or Space activates them. Separate message-reader windows keep their standard title bars.
 
 The top toolbar contains the message filter, Run query, Rules, Refresh, checked-message actions, a persistent reader visibility icon, reader placement, Auto-apply, and Theme. Label filtering has its own row below the status message. Sender groups are ordered by count, then address. Click a group to expand it and expose individual messages. Filtering searches From, Subject, and snippet. When the filter contains text, an SVG X appears inside its right edge. Click it, or focus it with Tab and press Enter or Space, to clear the filter and return input focus. It disappears when empty; Ctrl+Z restores the cleared text.
 
@@ -113,6 +118,8 @@ The label icon edits an empty saved space. Each custom space has a Remove space 
 
 ### Keyboard
 
+The Ctrl application shortcuts below also have Command equivalents on macOS. Mac text inputs support Command-A/C/X/V/Z, Command-Shift-Z for redo, Option-based word movement/deletion, and Command-based line movement/selection. Alt is Option on macOS.
+
 | Keys | Action |
 | --- | --- |
 | Tab / Shift+Tab | Move between controls |
@@ -152,12 +159,12 @@ Import accepts a combined settings export or a standalone rules array. A rules-o
 
 Rules use case-insensitive substring matching against From; the first match wins. Editing does not reorder them. Run query refreshes the capped Inbox and stages matches without overwriting existing manual marks.
 
-Configuration lives in `%USERPROFILE%\.mado\mado-mail`, equivalent to `~/.mado/mado-mail`:
+Configuration lives in `%USERPROFILE%\.mado\mado-mail` on Windows or `~/.mado/mado-mail` on macOS:
 
 - `settings.json` contains preferences and custom themes. `paneWidths.reader` stores the preferred reader width in logical pixels; `paneVisibility.reader` stores its visibility. `readerPosition` is `beside` by default or optionally `below`; `readerHeight` stores the preferred below-reader height. `stagingReviewOpen` independently stores whether review is expanded and defaults to false, including in older configurations. The bottom staging line is always present. Legacy `paneWidths.staging` and `paneVisibility.staging` remain readable and preserved but no longer create a sidebar. Rules and temporary overlays do not change saved reader/review visibility.
 - `settings.json` also stores `spaces`, each with a numeric `id`, a `name`, and `label_ids`. Older settings default to no spaces. Exports include spaces.
 - `rules.json` contains an ordered JSON array of sender rules. Each rule has `id`, `from`, and `action`; actions are `archive` or `trash`.
-- `client_secret.json`, `gpui.lock`, and `gpui-submission.json` also live here. Electron uses `token.json`; GPUI tokens remain in Windows Credential Manager.
+- `client_secret.json`, `gpui.lock`, and `gpui-submission.json` also live here. Electron uses `token.json`; GPUI tokens remain in the operating system credential store.
 
 First launch creates missing files. Existing combined settings are migrated without changing rule order or actions. An existing `rules.json` always wins over embedded rules, including when it is an empty array. Preferences are backed up before embedded rules are removed or missing Frost colors are added. A local `gpui-settings.json` is used only if `settings.json` is absent.
 
@@ -190,7 +197,7 @@ Example theme fields to add to the existing JSON:
 }
 ```
 
-The full settings file also contains `version` and `autoApply`. Available palette colors are `canvas`, `panel`, `panel2`, `line`, `ink`, `ink_dim`, `accent`, `danger`, `on_accent`, and `header_background`. Colors use hexadecimal strings such as `#087f5b`. The `frost` entry is editable and appears only once in the theme chooser. Switching themes updates readers that are already open; email HTML keeps its sender's styling. Native titlebars follow Windows appearance settings.
+The full settings file also contains `version` and `autoApply`. Available palette colors are `canvas`, `panel`, `panel2`, `line`, `ink`, `ink_dim`, `accent`, `danger`, `on_accent`, and `header_background`. Colors use hexadecimal strings such as `#087f5b`. The `frost` entry is editable and appears only once in the theme chooser. Switching themes updates readers that are already open; email HTML keeps its sender's styling. Native titlebars follow the operating system's appearance settings.
 
 Selection boxes show empty, checked, and mixed states. Their marks and the expand/collapse chevrons use custom SVGs embedded from `assets/icons/`; installed builds do not need those source files alongside the executable.
 
@@ -206,18 +213,18 @@ Writes currently run one message at a time for per-message outcomes. Large submi
 
 ## Reader and privacy
 
-The normal reader is an embedded pane in the main window. Its pop-out button copies the loaded, sanitized HTML, message details, labels, and current remote-image permission into a dedicated window without fetching the message from Gmail again. The new window starts at the top; the inline reader keeps its scroll position. Image controls then operate independently in each window. Detached readers remain open if you close the Inbox; the app exits after its last window closes. `cargo run --release -- --reader-demo` opens a standalone synthetic reader for diagnostics only. GPUI owns the controls; Wry hosts WebView2 for the sanitized HTML body. Embedded raster images display directly. HTTPS remote images load by default, including CSS background images. Block images disables remote loading for the current message; Allow images enables it again. Opening another message restores the default of allowing images. Remote images can disclose opens and IP addresses; blocking cannot undo requests already sent. Scripts and other disallowed content remain blocked regardless of image settings. Synthetic demos serve their remote-image fixture locally rather than making external requests.
+The normal reader is an embedded pane in the main window. Its pop-out button copies the loaded, sanitized HTML, message details, labels, and current remote-image permission into a dedicated window without fetching the message from Gmail again. The new window starts at the top; the inline reader keeps its scroll position. Image controls then operate independently in each window. Detached readers remain open if you close the Inbox; the app exits after its last window closes. `cargo run --release -- --reader-demo` opens a standalone synthetic reader for diagnostics only. GPUI owns the controls; Wry hosts WebView2 on Windows or WKWebView on macOS for the sanitized HTML body. Embedded raster images display directly. Windows allows HTTPS remote images by default, including CSS background images; macOS blocks them until explicit opt-in. Block images disables remote loading for the current message; Allow images enables it again. Opening another message restores that platform's default. Remote images can disclose opens and IP addresses; blocking cannot undo requests already sent. Scripts and other disallowed content remain blocked regardless of image settings. Synthetic demos serve their remote-image fixture locally rather than making external requests.
 
-Ammonia, Content Security Policy, and the native request guard block scripts, forms, frames, file URLs, downloads, dropped files, remote stylesheets/fonts, and disallowed requests. WebView2 uses an InPrivate profile, with scripts, host objects, web messaging, autofill, browser context menus, and browser-specific shortcuts disabled. User-initiated HTTP/HTTPS/mailto links open externally. The WebView never receives Gmail authorization tokens.
+Ammonia, Content Security Policy, and the native request guard block scripts, forms, frames, file URLs, downloads, dropped files, remote stylesheets/fonts, and disallowed requests. WebView2 uses an InPrivate profile, with scripts, host objects, web messaging, autofill, browser context menus, and browser-specific shortcuts disabled. On Windows, user-initiated HTTP/HTTPS/mailto links open externally. macOS uses an ephemeral WKWebView with scripts disabled and native WKContentRuleList resource rules in addition to CSP. Rule preparation failure disables the reader rather than loading without protection. macOS cancels external navigation, popups, downloads, and permission requests; it does not open reader links externally because Wry's callback lacks trusted user-initiation metadata. The WebView never receives Gmail authorization tokens.
 
 Supported embedded formats are PNG/JPEG/GIF/WebP/BMP. Inline SVG, CID CSS backgrounds, attachment browsing/downloads, and exact Gmail rendering parity are not supported. Limits remain 24 MiB JSON response, 4 MiB decoded body/image part, 12 MiB total body plus embedded image bytes, and 32 embedded images.
 
 Native child visibility follows pane visibility, Rules, resizing, and overlapping overlays. List-local menus leave the body visible in the beside layout. In the below layout, row menus and label details temporarily hide the native body so it cannot cover them. Mail dragging temporarily hides the native child so it cannot intercept the pointer while crossing to staging. The same reader and scroll position return after drop or cancellation. Closing a pane returns focus to the list; Tab can leave the browser body. WebView creation runs outside GPUI state borrows because Wry pumps Windows messages while starting.
 
-The application pins `gpui-pre` and `gpui-pre-platform` to `0.3.11`, aliased as `gpui` and `gpui_platform`. Startup uses `gpui_platform::application()` and sets `GPUI_DISABLE_DIRECT_COMPOSITION=1` before platform initialization. The default composition layer otherwise covers the WebView2 child. This uses the supported DirectX HWND rendering path, not software rendering. See [ADR 0002](adr/0002-gpui-pre.md) for package provenance and update requirements.
+The application pins `gpui-pre` and `gpui-pre-platform` to `0.3.11`, aliased as `gpui` and `gpui_platform`. Startup uses `gpui_platform::application()`. Windows sets `GPUI_DISABLE_DIRECT_COMPOSITION=1` before platform initialization. The default composition layer otherwise covers the WebView2 child. This uses the supported DirectX HWND rendering path, not software rendering. See [ADR 0002](adr/0002-gpui-pre.md) for package provenance and update requirements, and [ADR 0003](adr/0003-macos-support.md) for the macOS backend, runtime shaders, and verification limits.
 
 ## Verification limits
 
 Automated Gmail checks use local synthetic HTTP servers. Native triage and reader checks use synthetic mail only. No real messages are archived or trashed by the checks. Captures target only the selected app window, never the desktop. Reports and images live under `target/`.
 
-Real-account write behavior, account restart/refresh, and migrated personal settings need operator verification. Matched speed and total-memory comparisons against Electron have not been performed; implementation does not establish the performance goal. Include WebView2 child processes and the required GPUI renderer setting in those measurements.
+Apple Silicon macOS compilation, tests, reader checks, and isolated startup were verified. Intel macOS, Windows runtime regressions for this port, physical keyboard traversal, visual alignment, and native control usability remain unverified. Real-account write behavior, account restart/refresh, and migrated personal settings need operator verification. Matched speed and total-memory comparisons against Electron have not been performed; implementation does not establish the performance goal. Include WebView2 child processes and the required GPUI renderer setting in those measurements.

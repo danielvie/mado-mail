@@ -4,16 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[build-dependencies]
-embed-resource = "=3.0.11"
-
 [dependencies]
 anyhow = "1"
 ammonia = "=4.2.0"
 base64 = "0.22"
 encoding_rs = "0.8"
 futures = "0.3"
-gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false, features = ["windows-manifest"] }
+gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", default-features = false }
 keyring = "=4.2.0"
 oauth2 = { version = "=5.0.0", default-features = false, features = ["reqwest-blocking", "rustls-tls", "timing-resistant-secret-traits"] }
@@ -23,6 +20,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 unicode-segmentation = "1"
+wry = { version = "=0.57.0", default-features = false, features = ["os-webview"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false, features = ["windows-manifest"] }
 webview2-com = "=0.39.1"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
-wry = { version = "=0.57.0", default-features = false, features = ["os-webview"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "=3.0.11"
+
+# Already transitive through Wry; used for WKWebView's native resource guard.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", default-features = false, features = ["runtime_shaders", "font-kit"] }
+block2 = "=0.6.2"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSGraphicsContext", "NSResponder", "NSWindow", "block2"] }
+objc2 = "=0.6.4"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSString", "NSError"] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["WKContentRuleList", "WKContentRuleListStore", "WKUserContentController", "block2"] }

@@ -59,6 +59,25 @@ pub struct TextInput {
 }
 
 pub fn init(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-a", SelectAll, Some("TextInput")),
+        KeyBinding::new("cmd-c", Copy, Some("TextInput")),
+        KeyBinding::new("cmd-x", Cut, Some("TextInput")),
+        KeyBinding::new("cmd-v", Paste, Some("TextInput")),
+        KeyBinding::new("cmd-z", Undo, Some("TextInput")),
+        KeyBinding::new("cmd-shift-z", Redo, Some("TextInput")),
+        KeyBinding::new("alt-left", WordLeft, Some("TextInput")),
+        KeyBinding::new("alt-right", WordRight, Some("TextInput")),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, Some("TextInput")),
+        KeyBinding::new("alt-shift-right", SelectWordRight, Some("TextInput")),
+        KeyBinding::new("alt-backspace", DeleteWordLeft, Some("TextInput")),
+        KeyBinding::new("alt-delete", DeleteWordRight, Some("TextInput")),
+        KeyBinding::new("cmd-left", Home, Some("TextInput")),
+        KeyBinding::new("cmd-right", End, Some("TextInput")),
+        KeyBinding::new("cmd-shift-left", SelectHome, Some("TextInput")),
+        KeyBinding::new("cmd-shift-right", SelectEnd, Some("TextInput")),
+    ]);
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),

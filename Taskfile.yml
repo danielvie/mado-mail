@@ -7,25 +7,34 @@ tasks:
 
   run:
     desc: Run with Gmail
-    cmds: [cargo run --release]
+    cmds: [cargo run --release --locked]
 
   demo:
     desc: Run with synthetic mail
-    cmds: [cargo run --release -- --demo]
+    cmds: [cargo run --release --locked -- --demo]
 
   build:
     desc: Build release executable
-    cmds: [cargo build --release]
+    cmds: [cargo build --release --locked]
 
   install:
     desc: Build release and install to ~/.local/bin
     aliases: [i]
     deps: [build]
     cmds:
-      - >-
-        powershell.exe -NoProfile -Command '$ErrorActionPreference = "Stop";
-        New-Item -ItemType Directory -Force "$HOME/.local/bin" | Out-Null;
-        Copy-Item "target/release/mado-mail.exe" "$HOME/.local/bin/mado-mail.exe" -Force'
+      - cmd: >-
+          powershell.exe -NoProfile -Command '$ErrorActionPreference = "Stop";
+          New-Item -ItemType Directory -Force "$HOME/.local/bin" | Out-Null;
+          Copy-Item "target/release/mado-mail.exe" "$HOME/.local/bin/mado-mail.exe" -Force'
+        platforms: [windows]
+      - cmd: mkdir -p "$HOME/.local/bin" && install -m 755 target/release/mado-mail "$HOME/.local/bin/mado-mail"
+        platforms: [darwin]
+
+  reader-check:
+    desc: Offline native macOS reader/security regression (no Gmail)
+    platforms: [darwin]
+    deps: [build]
+    cmds: [python3 scripts/check-macos-reader.py]
 
   check:
     desc: Check all Rust targets against the locked dependencies
@@ -33,7 +42,7 @@ tasks:
 
   test:
     desc: Run Rust tests
-    cmds: [cargo test]
+    cmds: [cargo test --locked]
 
   clean:
     desc: Remove Rust build artifacts

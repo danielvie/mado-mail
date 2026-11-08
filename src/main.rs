@@ -1,5 +1,6 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(target_os = "windows")]
 mod color_check;
 mod gmail;
 mod icons;
@@ -8,6 +9,7 @@ mod labels;
 mod label_ui;
 mod message;
 mod reader;
+#[cfg(target_os = "windows")]
 mod reader_check;
 mod settings;
 mod staging_ui;
@@ -15,6 +17,7 @@ mod spaces;
 mod space_ui;
 mod theme;
 mod triage;
+#[cfg(target_os = "windows")]
 mod triage_check;
 
 use anyhow::{Context as _, Result};
@@ -44,6 +47,10 @@ actions!(
     [Refresh, Apply, FocusFilter, ToggleRules, ToggleStaging, ToggleReader]
 );
 
+#[cfg(target_os = "windows")]
+const SYSTEM_FONT: &str = "Segoe UI";
+#[cfg(target_os = "macos")]
+const SYSTEM_FONT: &str = ".AppleSystemUIFont";
 const DIVIDER: f32 = 6.;
 const SCROLLBAR_WIDTH: f32 = 12.;
 fn row_background(row: &Row, hovered: Option<&str>, active: bool, p: Palette) -> gpui::Hsla {
@@ -1168,6 +1175,10 @@ impl MailApp {
         }
         cx.notify();
     }
+    #[cfg(target_os = "macos")]
+    fn window_controls(&self, _: &Window, _: &Context<Self>) -> impl IntoElement { div() }
+
+    #[cfg(target_os = "windows")]
     fn window_controls(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx).header();
         let maximized = window.is_maximized();
@@ -1968,7 +1979,7 @@ impl Render for MailApp {
             .flex_col()
             .bg(p.canvas)
             .text_color(p.ink)
-            .font_family("Segoe UI")
+            .font_family(SYSTEM_FONT)
             .text_size(px(12.))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.load(true, false, cx)))
             .on_action(cx.listener(|this, _: &Apply, _, cx| this.submit(false, None, cx)))
@@ -2457,12 +2468,26 @@ impl Render for MailApp {
 fn main() {
     // GPUI's DirectComposition target covers child HWNDs; retain the child-safe DirectX HWND path.
     // SAFETY: Set startup configuration before GPUI, WebView2, or workers initialize.
+    #[cfg(target_os = "windows")]
     unsafe { std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1") };
+    #[cfg(target_os = "macos")]
+    if std::env::args().any(|arg| matches!(arg.as_str(), "--color-check" | "--triage-check" | "--detach-only")) {
+        eprintln!("This native check requires Windows. Use task reader-check on macOS.");
+        std::process::exit(2);
+    }
     gpui_platform::application()
         .with_assets(icons::Assets)
         .run(|cx: &mut App| {
             cx.set_global(Palette::default());
             input::init(cx);
+            #[cfg(target_os = "macos")]
+            cx.bind_keys([
+                KeyBinding::new("cmd-r", Refresh, Some("MailApp")),
+                KeyBinding::new("cmd-enter", Apply, Some("MailApp && !TextInput")),
+                KeyBinding::new("cmd-f", FocusFilter, Some("MailApp")),
+                KeyBinding::new("cmd-l", ToggleRules, Some("MailApp")),
+                KeyBinding::new("cmd-shift-b", ToggleStaging, Some("MailApp")),
+            ]);
             cx.bind_keys([
                 KeyBinding::new("alt-i", reader::ToggleImages, Some("MailReader")),
                 KeyBinding::new("ctrl-r", Refresh, Some("MailApp")),
@@ -2478,7 +2503,7 @@ fn main() {
                 }
             })
             .detach();
-            if std::env::args().any(|a| a == "--reader-demo" || a == "--reader-check") {
+            if std::env::args().any(|a| a == "--reader-demo" || (cfg!(target_os = "windows") && a == "--reader-check")) {
                 let reader = Reader::open(cx, "Mado Mail - Message reader demo").expect("Could not open reader");
                 reader
                     .update(cx, |reader, _, cx| reader.demo(cx))
@@ -2488,7 +2513,7 @@ fn main() {
             }
             let check_colors = std::env::args().any(|a| a == "--color-check");
             let check = check_colors || std::env::args().any(|a| a == "--triage-check");
-            let demo = check || std::env::args().any(|a| a == "--demo");
+            let demo = check || std::env::args().any(|a| a == "--demo" || (cfg!(target_os = "macos") && a == "--reader-check"));
             let bounds = Bounds::centered(None, size(px(1480.), px(850.)), cx);
             cx.open_window(
                 WindowOptions {
@@ -2496,7 +2521,7 @@ fn main() {
                     window_min_size: Some(size(px(1100.), px(600.))),
                     titlebar: Some(TitlebarOptions {
                         // https://docs.rs/gpui-pre/0.3.11/gpui/struct.TitlebarOptions.html
-                        appears_transparent: true,
+                        appears_transparent: cfg!(target_os = "windows"),
                         title: Some(
                             if demo {
                                 "Mado Mail - Demo"
@@ -2512,10 +2537,16 @@ fn main() {
                 move |window, cx| {
                     cx.new(|cx| {
                         let mut app = MailApp::new(window, cx, demo);
+                        #[cfg(target_os = "macos")]
+                        if std::env::args().any(|arg| arg == "--reader-check") {
+                            let id = app.triage.emails[0].id.clone();
+                            app.open_message(&id, window, cx);
+                        }
                         if !demo {
                             if !app.blocked { app.watch_colors(cx); }
                             app.load(false, false, cx);
                         }
+                        #[cfg(target_os = "windows")]
                         if check {
                             if check_colors {
                                 color_check::start(window.window_handle(), cx);

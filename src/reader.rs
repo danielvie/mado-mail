@@ -4,8 +4,10 @@ use crate::{
     theme::Palette,
 };
 use anyhow::{Context as _, Result};
+#[cfg(target_os = "windows")]
+use gpui::{AnyWindowHandle, AsyncApp, WeakEntity};
 use gpui::{
-    AnyWindowHandle, App, AsyncApp, Bounds, Context, FocusHandle, IntoElement, Render, TitlebarOptions, WeakEntity,
+    App, Bounds, Context, FocusHandle, IntoElement, Render, TitlebarOptions,
     Window, WindowBounds, WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, size,
 };
 use std::{
@@ -16,6 +18,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+#[cfg(target_os = "windows")]
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, FocusChangedEventHandler, MoveFocusRequestedEventHandler,
     Microsoft::Web::WebView2::Win32::{
@@ -27,17 +30,31 @@ use webview2_com::{
     NavigationStartingEventHandler, PermissionRequestedEventHandler,
     WebResourceRequestedEventHandler,
 };
+#[cfg(target_os = "windows")]
 use windows::core::{HSTRING, PWSTR};
+#[cfg(target_os = "windows")]
+use wry::{WebViewBuilderExtWindows, WebViewExtWindows};
 use wry::{
-    WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
+    WebView, WebViewBuilder,
     dpi::{LogicalPosition, LogicalSize},
     http::Response,
 };
 
 actions!(mail_reader, [ToggleImages]);
 
+#[cfg(target_os = "windows")]
 #[path = "detach_check.rs"]
 pub(crate) mod detach_check;
+#[cfg(target_os = "macos")]
+#[path = "reader_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+#[path = "macos_reader_check.rs"]
+mod macos_reader_check;
+#[cfg(target_os = "windows")]
+const DEFAULT_REMOTE: bool = true;
+#[cfg(target_os = "macos")]
+const DEFAULT_REMOTE: bool = macos::DEFAULT_REMOTE;
 
 #[derive(Clone)]
 struct Document {
@@ -56,6 +73,10 @@ pub struct Reader {
     document: Arc<RwLock<Document>>,
     generation: Arc<AtomicU64>,
     webview: Option<Rc<WebView>>,
+    #[cfg(target_os = "macos")]
+    policy: Option<macos::Policy>,
+    #[cfg(target_os = "macos")]
+    keyboard: Option<macos::Keyboard>,
     webview_error: Option<String>,
     status: String,
     failed: bool,
@@ -64,6 +85,7 @@ pub struct Reader {
 }
 
 // WebView2 callbacks run on the UI thread. Schedule browser opening rather than re-entering GPUI.
+#[cfg(target_os = "windows")]
 fn restrict(
     webview: &WebView,
     document: Arc<RwLock<Document>>,
@@ -250,6 +272,29 @@ fn restrict(
     Ok(())
 }
 
+fn native_bounds(bounds: Bounds<gpui::Pixels>, scale: f64) -> wry::Rect {
+    let position = LogicalPosition::new(f64::from(f32::from(bounds.origin.x)), f64::from(f32::from(bounds.origin.y)));
+    let size = LogicalSize::new(f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
+    #[cfg(target_os = "windows")]
+    { wry::Rect { position: position.to_physical::<i32>(scale).into(), size: size.to_physical::<i32>(scale).into() } }
+    #[cfg(target_os = "macos")]
+    {
+        // WK bounds() uses logical points, and set_bounds() rounds sizes to integral points.
+        let _ = scale;
+        wry::Rect { position: position.into(), size: LogicalSize::new(size.width.round(), size.height.round()).into() }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn retina_reader_bounds_remain_in_logical_points() {
+    let bounds = Bounds::new(gpui::point(px(100.5), px(200.)), size(px(480.), px(329.)));
+    let rect = native_bounds(bounds, 2.);
+    assert_eq!(rect.position, wry::dpi::Position::Logical(LogicalPosition::new(100.5, 200.)));
+    assert_eq!(rect.size, wry::dpi::Size::Logical(LogicalSize::new(480., 329.)));
+    assert_eq!(rect, native_bounds(bounds, 1.));
+}
+
 impl Reader {
     pub fn open(cx: &mut App, title: impl Into<gpui::SharedString>) -> Result<WindowHandle<Self>> {
         let title = title.into();
@@ -280,8 +325,10 @@ impl Reader {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.defer_in(window, |this: &mut Self, window, cx| this.mount(window, cx));
         let body_focus = cx.focus_handle();
-        cx.on_focus(&body_focus, window, |this: &mut Self, _, _| {
-            if this.visible && let Some(webview) = &this.webview { let _ = webview.focus(); }
+        cx.on_focus(&body_focus, window, |this: &mut Self, window, _| {
+            // A frame's focus event must not override a newer host focus change.
+            if this.visible && this.body_focus.is_focused(window)
+                && let Some(webview) = &this.webview { let _ = webview.focus(); }
         }).detach();
         Self {
             focus: cx.focus_handle(),
@@ -295,10 +342,14 @@ impl Reader {
             labels: Vec::new(),
             loaded: false,
             document: Arc::new(RwLock::new(Document {
-                html: MessageBody::plain("Select a message.").document(), remote: true,
+                html: MessageBody::plain("Select a message.").document(), remote: DEFAULT_REMOTE,
             })),
             generation: Arc::new(AtomicU64::new(0)),
             webview: None,
+            #[cfg(target_os = "macos")]
+            policy: None,
+            #[cfg(target_os = "macos")]
+            keyboard: None,
             webview_error: None,
             status: "Select a message. Preview preserves unread status.".into(),
             failed: false,
@@ -360,6 +411,7 @@ impl Reader {
         self.email.id != id || self.failed
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn browser(&self) -> Option<Rc<WebView>> {
         self.webview.clone()
     }
@@ -380,14 +432,19 @@ impl Reader {
         // Wry pumps Win32 messages during creation. Never hold a GPUI App/Entity borrow across it.
         cx.spawn(async move |this, cx| {
         if host.update(cx, |_, _, _| ()).is_err() { return; }
+        #[cfg(target_os = "macos")]
+        let policy = macos::Policy::prepare(macos::synthetic()).await;
+        if host.update(cx, |_, _, _| ()).is_err() { return; }
         let result = (|| {
+            #[cfg(target_os = "macos")]
+            let policy = policy.context("WKWebView resource protection could not start; reader disabled")?;
             // SAFETY: this UI-thread task uses the host's native handle only for child creation.
             // A closed host rejects attachment; the result is kept only if the host still exists.
             let parent = unsafe { wry::raw_window_handle::WindowHandle::borrow_raw(raw) };
             let resources = document.clone();
             let view = this.clone();
             let app = cx.clone();
-            let webview = WebViewBuilder::new()
+            let builder = WebViewBuilder::new()
                 .with_visible(false)
                 .with_on_page_load_handler(move |event, uri| {
                     if !matches!(event, wry::PageLoadEvent::Finished) { return; }
@@ -403,38 +460,79 @@ impl Reader {
                     }).detach();
                 })
                 .with_javascript_disabled().with_devtools(false).with_incognito(true)
-                .with_general_autofill_enabled(false).with_default_context_menus(false)
-                .with_browser_accelerator_keys(false).with_https_scheme(true)
+                .with_general_autofill_enabled(false)
                 .with_hotkeys_zoom(true).with_autoplay(false)
                 .with_drag_drop_handler(|_| true)
                 .with_download_started_handler(|_, _| false)
-                .with_bounds(wry::Rect { position: LogicalPosition::new(0., 160.).into(), size: LogicalSize::new(960., 640.).into() })
-                .with_custom_protocol("mado".into(), move |_, request| {
+                .with_bounds(wry::Rect { position: LogicalPosition::new(0., 160.).into(), size: LogicalSize::new(960., 640.).into() });
+            #[cfg(target_os = "windows")]
+            let builder = builder.with_default_context_menus(false).with_browser_accelerator_keys(false).with_https_scheme(true);
+            #[cfg(target_os = "macos")]
+            let builder = macos::restrict(builder);
+            let webview = builder.with_custom_protocol("mado".into(), move |_, request| {
                     let doc = resources.read().unwrap();
                     // The protocol receives mado://localhost/message after Wry reverses its Windows URL mapping.
+                    #[cfg(target_os = "macos")]
+                    if macos::synthetic() && request.method() == "GET" && request.uri().to_string() == macos::FIXTURE_URL {
+                        return Response::builder().header("Content-Type", "image/png").header("Cache-Control", "no-store")
+                            .body(Cow::Borrowed(include_bytes!("../fixtures/reader-banner.png").as_slice())).unwrap();
+                    }
+                    #[cfg(target_os = "windows")]
                     let valid = request.method() == "GET" && request.uri().path() == "/message";
+                    #[cfg(target_os = "macos")]
+                    let valid = request.method() == "GET" && message::reader_document(&request.uri().to_string());
+                    #[cfg(target_os = "windows")]
+                    let policy = message::content_policy(doc.remote);
+                    #[cfg(target_os = "macos")]
+                    let policy = macos::content_policy(doc.remote, macos::synthetic());
+                    let html = doc.html.clone();
+                    #[cfg(target_os = "macos")]
+                    let html = if macos::synthetic() { html.replace("https://example.invalid/remote-banner.png", macos::FIXTURE_URL) } else { html };
                     Response::builder().status(if valid { 200 } else { 404 })
                         .header("Content-Type", "text/html; charset=utf-8")
-                        .header("Content-Security-Policy", message::content_policy(doc.remote))
+                        .header("Content-Security-Policy", policy)
                         .header("Referrer-Policy", "no-referrer")
                         .header("Cache-Control", "no-store")
-                        .body(Cow::Owned(if valid { doc.html.as_bytes().to_vec() } else { Vec::new() })).unwrap()
-                }).build_as_child(&parent).context("WebView2 could not start. Install the Microsoft Edge WebView2 Runtime and reopen the app")?;
+                        .body(Cow::Owned(if valid { html.into_bytes() } else { Vec::new() })).unwrap()
+                }).build_as_child(&parent).context("Native message reader could not start (Windows requires the Edge WebView2 Runtime)")?;
+            #[cfg(target_os = "windows")]
             restrict(&webview, document.clone(), cx.clone(), this.clone(), host)?;
+            #[cfg(target_os = "macos")]
+            policy.apply(&webview, document.read().unwrap().remote);
+            #[cfg(target_os = "macos")]
+            let keyboard = macos::keyboard(&webview, cx.clone(), this.clone(), host)?;
             webview.load_url(&format!("{READER_URL}?revision={}", generation.load(Ordering::Relaxed)))?;
-            anyhow::Ok(webview)
+            #[cfg(target_os = "windows")]
+            return anyhow::Ok(webview);
+            #[cfg(target_os = "macos")]
+            anyhow::Ok((webview, policy, keyboard))
         })();
         let _ = host.update(cx, |_, window, cx| {
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(webview) => {
+                    Ok(result) => {
+                        #[cfg(target_os = "windows")]
+                        let webview = result;
+                        #[cfg(target_os = "macos")]
+                        let webview = { this.policy = Some(result.1); this.keyboard = Some(result.2); result.0 };
                         let webview = Rc::new(webview);
+                        #[cfg(target_os = "windows")]
                         if std::env::args().any(|arg| arg == "--reader-check") {
                             crate::reader_check::start(webview.clone(), window, cx);
                         }
+                        #[cfg(target_os = "macos")]
+                        if std::env::args().any(|arg| arg == "--reader-check") {
+                            macos_reader_check::start(webview.clone(), window, cx);
+                        }
                         this.webview = Some(webview);
                     }
-                    Err(error) => this.webview_error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        #[cfg(target_os = "macos")]
+                        if std::env::args().any(|arg| arg == "--reader-check") {
+                            macos_reader_check::fail(&format!("Reader startup failed: {error:#}"));
+                        }
+                        this.webview_error = Some(format!("{error:#}"));
+                    }
                 }
                 cx.notify();
             });
@@ -444,7 +542,7 @@ impl Reader {
 
     fn show(&mut self, body: MessageBody, cx: &mut Context<Self>) {
         self.status = if self.document.read().unwrap().remote {
-            "Remote images allowed by default. They can track opens and IP addresses."
+            "Remote images allowed. They can track opens and IP addresses."
         } else {
             "Remote images blocked. Blocking cannot undo requests already sent."
         }
@@ -463,6 +561,8 @@ impl Reader {
         self.page_ready = false;
         if let Some(webview) = &self.webview {
             let _ = webview.set_visible(false);
+            #[cfg(target_os = "macos")]
+            if let Some(policy) = &self.policy { policy.apply(webview, self.document.read().unwrap().remote); }
             if let Err(error) = webview.load_url(&format!(
                 "{READER_URL}?revision={}",
                 self.generation.load(Ordering::Relaxed)
@@ -483,7 +583,7 @@ impl Reader {
         self.status = "Loading message...".into();
         *self.document.write().unwrap() = Document {
             html: MessageBody::plain("Loading message...").document(),
-            remote: true,
+            remote: DEFAULT_REMOTE,
         };
         self.reload(cx);
         let id = self.email.id.clone();
@@ -543,7 +643,7 @@ impl Reader {
 
     pub fn demo(&mut self, cx: &mut Context<Self>) {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.document.write().unwrap().remote = true;
+        self.document.write().unwrap().remote = DEFAULT_REMOTE;
         self.email = Email {
             id: "demo".into(),
             from: "Synthetic club <demo@example.invalid>".into(),
@@ -557,7 +657,7 @@ impl Reader {
 
     pub fn demo_message(&mut self, email: Email, cx: &mut Context<Self>) {
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.document.write().unwrap().remote = true;
+        self.document.write().unwrap().remote = DEFAULT_REMOTE;
         self.email = email;
         self.show(message::demo(), cx);
     }
@@ -606,7 +706,7 @@ impl Render for Reader {
             .flex_col()
             .bg(p.canvas)
             .text_color(p.ink)
-            .font_family("Segoe UI")
+            .font_family(crate::SYSTEM_FONT)
             .text_sm()
             .child(
                 div()
@@ -716,22 +816,7 @@ impl Render for Reader {
                 .flex_1().w_full().min_h_0().flex().child(canvas(
                     move |bounds, window, _| {
                         if let Some(webview) = webview {
-                            // Wry reports physical bounds. Compare like units to avoid resize work on every frame.
-                            let scale = f64::from(window.scale_factor());
-                            let rect = wry::Rect {
-                                position: LogicalPosition::new(
-                                    f64::from(f32::from(bounds.origin.x)),
-                                    f64::from(f32::from(bounds.origin.y)),
-                                )
-                                .to_physical::<i32>(scale)
-                                .into(),
-                                size: LogicalSize::new(
-                                    f64::from(f32::from(bounds.size.width)),
-                                    f64::from(f32::from(bounds.size.height)),
-                                )
-                                .to_physical::<i32>(scale)
-                                .into(),
-                            };
+                            let rect = native_bounds(bounds, f64::from(window.scale_factor()));
                             if webview.bounds().is_ok_and(|old| old != rect) {
                                 let _ = webview.set_bounds(rect);
                             }

@@ -265,12 +265,34 @@ pub fn backup(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub fn directory() -> Result<PathBuf> {
-    Ok(
-        PathBuf::from(std::env::var_os("USERPROFILE").context("USERPROFILE is not set")?)
-            .join(".mado/mado-mail"),
-    )
+#[cfg(target_os = "windows")]
+const HOME_VARIABLE: &str = "USERPROFILE";
+#[cfg(target_os = "macos")]
+const HOME_VARIABLE: &str = "HOME";
+
+fn directory_in(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    let home = home.filter(|home| !home.is_empty()).context("Home directory is not set")?;
+    let home = PathBuf::from(home);
+    ensure!(home.is_absolute(), "Home directory must be absolute");
+    Ok(home.join(".mado/mado-mail"))
 }
+pub fn directory() -> Result<PathBuf> {
+    directory_in(std::env::var_os(HOME_VARIABLE))
+}
+#[cfg(test)]
+#[test]
+fn home_directory_policy() {
+    assert!(directory_in(None).is_err());
+    assert!(directory_in(Some("".into())).is_err());
+    assert!(directory_in(Some("relative".into())).is_err());
+    let root = std::env::temp_dir();
+    assert_eq!(directory_in(Some(root.clone().into())).unwrap(), root.join(".mado/mado-mail"));
+    #[cfg(target_os = "macos")]
+    assert_eq!(HOME_VARIABLE, "HOME");
+    #[cfg(target_os = "windows")]
+    assert_eq!(HOME_VARIABLE, "USERPROFILE");
+}
+
 pub fn config_path() -> Result<PathBuf> {
     Ok(directory()?.join("settings.json"))
 }

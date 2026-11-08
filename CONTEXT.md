@@ -7,7 +7,7 @@
 - `src/staging_ui.rs` renders the persistent bottom staging line and shallow review tray, including destination drop targets, counts, outcomes, and Put back controls.
 - `src/gmail.rs` owns OAuth with loopback callback and PKCE, credential storage, Inbox retrieval, MIME decoding, Gmail writes, and reconciliation.
 - `src/settings.rs` validates and saves preferences, separate sender rules, imports, and submission journals.
-- `src/reader.rs` hosts the restricted WebView2 HTML reader through Wry. `message.rs` sanitizes content and defines resource/link policies.
+- `src/reader.rs` hosts the restricted Wry reader using WebView2 on Windows or WKWebView on macOS. `reader_macos.rs` adds native WK resource rules and keyboard routing. `message.rs` sanitizes content and defines resource/link policies. See `docs/adr/0003-macos-support.md` for platform differences.
 - `src/input.rs` implements text input. `theme.rs` and `icons.rs` provide GPUI presentation assets.
 - `src/labels.rs` and `label_ui.rs` provide label metadata, chips, filtering, and assignment controls.
 - `src/spaces.rs` and `space_ui.rs` provide saved label destinations and staging controls.
@@ -25,7 +25,7 @@
 
 ## Persistence and safety
 
-Personal files live in `%USERPROFILE%\.mado\mado-mail`: `settings.json`, `rules.json`, `client_secret.json`, `gpui.lock`, and `gpui-submission.json`. Refresh tokens live in Windows Credential Manager.
+Personal files live in `%USERPROFILE%\.mado\mado-mail` on Windows or `~/.mado/mado-mail` on macOS: `settings.json`, `rules.json`, `client_secret.json`, `gpui.lock`, and `gpui-submission.json`. Refresh tokens live in Windows Credential Manager or macOS Keychain.
 
 Settings include the theme, Auto-apply, reader size/visibility/placement, independent `stagingReviewOpen`, and spaces. Legacy staging width/visibility values remain readable but no longer create a right sidebar. Active-theme colors reload while the Inbox is open; other settings do not. Selection, reader contents, and ordinary unsubmitted marks are session state. Interrupted submissions survive in the journal and must be reconciled. Invalid settings are reported rather than overwritten.
 

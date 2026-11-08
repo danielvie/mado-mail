@@ -3,7 +3,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use oauth2::url::Url;
 use std::collections::HashMap;
 
+#[cfg(target_os = "windows")]
 pub const READER_URL: &str = "https://mado.localhost/message";
+#[cfg(target_os = "macos")]
+pub const READER_URL: &str = "mado://localhost/message";
 
 pub struct MessageBody {
     html: String,
@@ -39,8 +42,8 @@ pub fn remote_image(uri: &str, allowed: bool) -> bool {
 
 pub fn reader_document(uri: &str) -> bool {
     Url::parse(uri).is_ok_and(|url| {
-        url.scheme() == "https"
-            && url.host_str() == Some("mado.localhost")
+        ((cfg!(target_os = "windows") && url.scheme() == "https" && url.host_str() == Some("mado.localhost"))
+            || (cfg!(target_os = "macos") && url.scheme() == "mado" && url.host_str() == Some("localhost")))
             && url.port().is_none()
             && url.path() == "/message"
             && url.username().is_empty()
@@ -235,5 +238,11 @@ mod tests {
         assert!(reader_document(&format!("{READER_URL}?revision=2")));
         assert!(!reader_document("https://mado.localhost.evil/message"));
         assert!(!reader_document("https://mado.localhost:8443/message"));
+        assert!(!reader_document("mado://localhost/other"));
+        assert!(!reader_document("mado://user@localhost/message"));
+        assert!(!reader_document("mado://localhost:8443/message"));
+        assert!(!reader_document("mado://localhost.evil/message"));
+        #[cfg(target_os = "macos")]
+        assert!(!reader_document("https://mado.localhost/message"));
     }
 }
